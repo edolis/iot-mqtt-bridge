@@ -9,25 +9,28 @@ import paho.mqtt.client as mqtt
 import pymysql
 from pymysql import Error as MySQLError
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# ==================== CONFIGURATION (from environment) ====================
+# ==================== CONFIGURATION ====================
 MQTT_BROKER = os.getenv("MQTT_BROKER", "raspi00")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "IOT_DB/#")
 MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "true").lower() == "true"
 MQTT_TLS_CA_CERTS = os.getenv("MQTT_TLS_CA_CERTS", "/etc/mosquitto/certs/ca.crt")
-MQTT_USERNAME = os.getenv("MQTT_USER", "")
+MQTT_USERNAME = os.getenv("MQTT_USER", "edolis")
 MQTT_PASSWORD = os.getenv("MQTT_PASS", "")
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "")
-DB_PASSWORD = os.getenv("DB_PASS", "")
+DB_USER = os.getenv("DB_USER", "pyBridge")
+DB_PASSWORD = os.getenv("DB_PASS", "pyBridgeSpring")
 DB_NAME = os.getenv("DB_NAME", "IOT_DB")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Reserved JSON keys
 RESERVED_KEYS_DAT = {"dNM", "dPJ", "dS"}
 RESERVED_KEYS_DIAG = {"dNM", "dDGT"}
+
+# Session timeout (minutes)
+SESSION_TIMEOUT_MINUTES = 30
 
 # Global database connection and column cache
 db_conn = None
@@ -46,7 +49,6 @@ def sanitize_name(raw, prefix):
     return f"{prefix}_{clean}"
 
 def get_sql_type(value):
-    # UNCHANGED – future‑proof dynamic column creation
     if isinstance(value, bool):
         return "TINYINT(1)"
     elif isinstance(value, int):
@@ -125,6 +127,39 @@ def insert_data_row(conn, table_name, dev_id, ts, data_fields):
             logger.error(f"Insert error: {e}")
             raise
 
+def get_or_create_connection(conn, dev_id):
+    """Return current open connection ID for the device, or create a new one.
+       Also updates last_msg_ts for that connection."""
+    with conn.cursor() as cursor:
+        # Look for an open connection (disconnected_ts IS NULL)
+        cursor.execute("""
+            SELECT conn_id, last_msg_ts FROM DEVICE_CONN
+            WHERE devID = %s AND disconnected_ts IS NULL
+            ORDER BY last_msg_ts DESC LIMIT 1
+        """, (dev_id,))
+        row = cursor.fetchone()
+        now = datetime.now()
+        if row:
+            conn_id, last_msg = row
+            # If last message is older than timeout, close this session and create a new one
+            if now - last_msg > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
+                cursor.execute("UPDATE DEVICE_CONN SET disconnected_ts = %s WHERE conn_id = %s",
+                               (now, conn_id))
+                conn.commit()
+                row = None
+        if not row:
+            # Create a new connection session
+            cursor.execute("INSERT INTO DEVICE_CONN (devID, connected_ts, last_msg_ts) VALUES (%s, %s, %s)",
+                           (dev_id, now, now))
+            conn_id = cursor.lastrowid
+            conn.commit()
+        else:
+            conn_id = row[0]
+        # Update last_msg_ts for this connection (always)
+        cursor.execute("UPDATE DEVICE_CONN SET last_msg_ts = %s WHERE conn_id = %s", (now, conn_id))
+        conn.commit()
+        return conn_id
+
 def get_db_connection():
     global db_conn
     try:
@@ -154,22 +189,32 @@ def process_diagnostics(conn, data, topic, dev_name):
     if not diag_type:
         logger.warning(f"Missing dDGT in DIAG message from {topic} (device {dev_name}) – ignoring")
         return
+
     with conn.cursor() as cursor:
         cursor.execute("CALL GetDeviceID(%s, @devID)", (dev_name,))
         cursor.execute("SELECT @devID")
         dev_id = cursor.fetchone()[0]
         conn.commit()
+        logger.debug(f"Device {dev_name} -> devID {dev_id} (diagnostic only)")
+
+    # Update connection session
+    conn_id = get_or_create_connection(conn, dev_id)
+    logger.debug(f"Connection ID {conn_id} last_msg_ts updated")
+
     table_name = sanitize_name(diag_type, "dia")
     ensure_data_table(conn, table_name)
+
     dynamic_fields = {}
     for key, value in data.items():
         if key in RESERVED_KEYS_DIAG:
             continue
         col_name = "d_" + re.sub(r'[^A-Za-z0-9_]', '_', key)
         dynamic_fields[col_name] = value
+
     for col_name, value in dynamic_fields.items():
         sql_type = get_sql_type(value)
         add_column_if_not_exists(conn, table_name, col_name, sql_type)
+
     now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     insert_data_row(conn, table_name, dev_id, now_ts, dynamic_fields)
     logger.debug(f"Diagnostic data for {dev_name} saved into {table_name}")
@@ -179,29 +224,41 @@ def process_data(conn, data, topic, dev_name):
     if save_flag not in ('S', 's', 'Y', 'y', '1'):
         logger.debug(f"Ignoring DAT message: dS={save_flag}")
         return
+
     proj_id = data.get('dPJ')
     if proj_id is None:
         proj_id = ""
     else:
         proj_id = str(proj_id).strip()
+
     now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     with conn.cursor() as cursor:
         cursor.execute("CALL GetOrCreateDevice(%s, %s, @devID)", (dev_name, proj_id))
         cursor.execute("SELECT @devID")
         dev_id = cursor.fetchone()[0]
         conn.commit()
+        logger.debug(f"Device {dev_name} -> devID {dev_id}")
+
+    # Update connection session
+    conn_id = get_or_create_connection(conn, dev_id)
+    logger.debug(f"Connection ID {conn_id} last_msg_ts updated")
+
     if proj_id:
         table_name = sanitize_name(proj_id, "dt")
         ensure_data_table(conn, table_name)
+
         dynamic_fields = {}
         for key, value in data.items():
             if key in RESERVED_KEYS_DAT:
                 continue
             col_name = "d_" + re.sub(r'[^A-Za-z0-9_]', '_', key)
             dynamic_fields[col_name] = value
+
         for col_name, value in dynamic_fields.items():
             sql_type = get_sql_type(value)
             add_column_if_not_exists(conn, table_name, col_name, sql_type)
+
         insert_data_row(conn, table_name, dev_id, now_ts, dynamic_fields)
         logger.debug(f"Data for {dev_name} saved into {table_name}")
     else:
@@ -213,6 +270,7 @@ def on_message(client, userdata, msg):
         data = json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return
+
     topic = msg.topic
     if topic.startswith("IOT_DB/DAT"):
         msg_type = "DAT"
@@ -220,10 +278,12 @@ def on_message(client, userdata, msg):
         msg_type = "DIAG"
     else:
         return
+
     dev_name = data.get('dNM')
     if not dev_name:
         logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
         return
+
     try:
         conn = get_db_connection()
         if msg_type == "DAT":
@@ -232,7 +292,6 @@ def on_message(client, userdata, msg):
             process_diagnostics(conn, data, topic, dev_name)
     except Exception as e:
         logger.error(f"Device: {dev_name} – {str(e)}")
-        # Do not close the connection here – it will be reused
 
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
@@ -255,7 +314,6 @@ def main():
         try:
             client.tls_set(ca_certs=MQTT_TLS_CA_CERTS,
                            tls_version=ssl.PROTOCOL_TLSv1_2)
-            # Do NOT use tls_insecure_set(True) – keep full security
             logger.info("TLS configured with CA cert: %s", MQTT_TLS_CA_CERTS)
         except Exception as e:
             logger.error(f"TLS setup failed: {e}")

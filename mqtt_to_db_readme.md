@@ -1,194 +1,168 @@
-# MQTT to MariaDB Bridge – Configuration & Documentation
+# MQTT to MariaDB Bridge – Connection Tracking Edition
 
 ## Overview
 
-This bridge subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
+This service subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
+It also tracks **device connection sessions**: each time a device (re)connects (or resumes sending after a timeout), a new session is created with a unique connection ID. That session’s `last_msg_ts` is updated on every subsequent message, and the session is automatically closed after a defined inactivity period.
+
 Two message types are supported:
 
 - **Data messages** (`IOT_DB/DAT/...`) – require `dNM`, `dPJ`, `dS` fields. Saved into project‑specific tables `dt_<projectID>`.
 - **Diagnostic messages** (`IOT_DB/DIAG/...`) – require `dNM`, `dDGT` fields. Saved into diagnostic tables `dia_<diagnostic_type>`.
 
-The bridge automatically creates tables and columns on the fly based on the JSON structure.
+---
 
-## System Architecture
+## MQTT Topics
 
-```mermaid
-flowchart TD
-    ESP32[ESP32 Device] -->|MQTT JSON| Broker[Mosquitto Broker<br/>TLS port 8883]
-    Broker -->|Subscribe IOT_DB/#| Bridge[Python Bridge Service<br/>mqtt_to_db.py]
-    Bridge -->|Check required fields| Validate{Valid JSON?}
-    Validate -->|No| Ignore[Ignore message]
-    Validate -->|Yes| TopicType{Topic prefix?}
-    TopicType -->|IOT_DB/DAT| Data[Process Data Message]
-    TopicType -->|IOT_DB/DIAG| Diag[Process Diagnostic Message]
-    Data --> GetDevData[CALL GetOrCreateDevice<br/>updates devLastSeen and devPROJID]
-    Diag --> GetDevDiag[CALL GetDeviceID<br/>updates only devLastSeen]
-    GetDevData --> HasPJ{dPJ non‑empty?}
-    HasPJ -->|Yes| CreateDataTable[Create/use dt_<projectID> table]
-    HasPJ -->|No| DiscardData[Discard sensor data]
-    CreateDataTable --> AddColsData[Add dynamic columns d_<key>]
-    AddColsData --> InsertData[Insert row]
-    GetDevDiag --> HasDGT{dDGT present?}
-    HasDGT -->|Yes| CreateDiagTable[Create/use dia_<diagnostic_type> table]
-    HasDGT -->|No| LogWarning[Log warning]
-    CreateDiagTable --> AddColsDiag[Add dynamic columns d_<key>]
-    AddColsDiag --> InsertDiag[Insert row]
-    InsertData --> MariaDB[(MariaDB<br/>IOT_DB)]
-    InsertDiag --> MariaDB
-    DiscardData --> MariaDB
+| Topic pattern               | Purpose                                                   | Required JSON fields                     |
+|-----------------------------|-----------------------------------------------------------|------------------------------------------|
+| `IOT_DB/DAT/#`              | Sensor data (e.g., temperature, humidity)                 | `dNM`, `dPJ`, `dS`                       |
+| `IOT_DB/DIAG/#`             | Diagnostic data (e.g., CPU temperature, memory usage)     | `dNM`, `dDGT`                            |
+
+---
+
+## JSON Message Formats
+
+### Data Messages (`IOT_DB/DAT/#`)
+
+**Required fields:**
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `dNM` | Device name (unique identifier, max 12 chars) | `"ESP_41:2F:6C"` |
+| `dPJ` | Project ID (e.g., `"P001"`). If empty or missing, **no sensor data is saved** – only device record is updated. | `"P001"` |
+| `dS`  | Save flag – one of: `"S"`, `"s"`, `"Y"`, `"y"`, `"1"`. Otherwise message is ignored. | `"S"` |
+
+Any additional key‑value pairs are stored as dynamic columns prefixed with `d_` (e.g., `temperature` → `d_temperature`).
+
+**Example:**
+
+```json
+{
+  "dNM": "ESP_ABC123",
+  "dPJ": "P002",
+  "dS": "S",
+  "temperature": 23.5,
+  "humidity": 60
+}
 ```
 
-## JSON Message Formats – Flow
+### Diagnostic Messages (`IOT_DB/DIAG/#`)
 
-```mermaid
-sequenceDiagram
-    participant ESP as ESP32
-    participant MQTT as Mosquitto Broker
-    participant Bridge as Python Bridge
-    participant DB as MariaDB
+**Required fields:**
 
-    ESP->>MQTT: PUBLISH to IOT_DB/DAT/sensor<br/>{"dNM":"ESP01","dPJ":"P001","dS":"S","temp":23.5}
-    MQTT->>Bridge: Deliver message
-    Bridge->>Bridge: Parse JSON, check dS flag
-    Bridge->>DB: CALL GetOrCreateDevice('ESP01','P001',@devID)
-    DB-->>Bridge: devID = 1
-    Bridge->>DB: CREATE TABLE IF NOT EXISTS dt_P001
-    Bridge->>DB: ALTER TABLE dt_P001 ADD COLUMN d_temp DECIMAL(20,10)
-    Bridge->>DB: INSERT INTO dt_P001 (deviceID, ts, d_temp) VALUES (1, NOW(), 23.5)
-    DB-->>Bridge: OK
-    Bridge->>Bridge: Log success
+| Field | Description | Example |
+|-------|-------------|---------|
+| `dNM` | Device name (unique identifier) | `"ESP_41:2F:6C"` |
+| `dDGT` | Diagnostic type – table name `dia_<type>` | `"cpu"`, `"memory"` |
+
+All other fields are stored as dynamic columns (prefixed with `d_`). The device’s project ID (`devPROJID`) is **not** modified.
+
+**Example:**
+
+```json
+{
+  "dNM": "ESP_ABC123",
+  "dDGT": "cpu",
+  "temperature": 65.2,
+  "load": 0.75
+}
 ```
 
-## Configuration
+---
 
-All settings are read from **environment variables** (keeps credentials out of the script).
+## Configuration (Environment Variables)
 
-### Environment variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `MQTT_BROKER` | MQTT broker hostname or IP | `raspi00` |
-| `MQTT_PORT` | MQTT port (TLS usually 8883) | `8883` |
-| `MQTT_USER` | MQTT username | `your_mqtt_user` |
-| `MQTT_PASS` | MQTT password | `your_mqtt_password` |
-| `MQTT_TLS_ENABLED` | `true` or `false` | `true` |
-| `MQTT_TLS_CA_CERTS` | Path to CA certificate file | `/etc/mosquitto/certs/ca.crt` |
-| `DB_HOST` | MariaDB host | `localhost` |
-| `DB_USER` | Database user | `your_db_user` |
-| `DB_PASS` | Database password | `your_db_password` |
-| `DB_NAME` | Database name | `IOT_DB` |
-| `LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
-
-### Where to change username/password
-
-1. **MQTT authentication** – set `MQTT_USER` and `MQTT_PASS` in the environment file.
-2. **Database authentication** – set `DB_USER` and `DB_PASS` in the same file.
-
-Example environment file (`/etc/mqtt2db/env`):
+All settings are read from environment variables. Create a file `/etc/mqtt2db/env`:
 
 ```
 MQTT_BROKER=raspi00
 MQTT_PORT=8883
-MQTT_USER=someone
-MQTT_PASS=secret123
-DB_USER=someDbUser
-DB_PASS=myDbPass
+MQTT_USER=edolis
+MQTT_PASS=your_mqtt_password
+MQTT_TLS_ENABLED=true
+MQTT_TLS_CA_CERTS=/etc/mosquitto/certs/ca.crt
+DB_HOST=localhost
+DB_USER=pyBridge
+DB_PASS=pyBridgeSpring
+DB_NAME=IOT_DB
 LOG_LEVEL=INFO
 ```
 
-## Logging
+### Changing Username/Password
 
-The bridge logs to two places (configurable in the script):
+- MQTT authentication: edit `MQTT_USER` and `MQTT_PASS`.
+- Database authentication: edit `DB_USER` and `DB_PASS`.
 
-- **Systemd journal** – view with `journalctl -u mqtt2db.service -f`
-- **File** – default location `/var/log/mqtt2db/mqtt2db.log` (rotation: 10 MB per file, 5 backups)
+After changes, restart the service: `sudo systemctl restart mqtt2db.service`.
 
-### Viewing logs
+---
 
-| Action | Command |
-|--------|---------|
-| Follow live logs (systemd) | `sudo journalctl -u mqtt2db.service -f` |
-| Show last 100 lines | `sudo journalctl -u mqtt2db.service -n 100` |
-| Follow file log | `tail -f /var/log/mqtt2db/mqtt2db.log` |
-| Search for errors | `grep ERROR /var/log/mqtt2db/mqtt2db.log` |
+## Connection Tracking – Table `DEVICE_CONN`
 
-To change the log level, set `LOG_LEVEL=DEBUG` (or `WARNING`) in the environment file and restart the service.
+The bridge maintains a table `DEVICE_CONN` that records each device’s connection session. A new session is created when:
 
-## How the Bridge Works – Internal Flow
+- The device sends its first message after the service starts, or
+- The device resumes sending after an inactivity period longer than `SESSION_TIMEOUT_MINUTES` (default 30 minutes).
 
-```mermaid
+Every message updates the `last_msg_ts` of the current active session. When the timeout expires, the session is closed (`disconnected_ts` set) and the next message opens a new session.
 
-stateDiagram-v2
-    [*] --> MQTT_Connect
-    MQTT_Connect --> Subscribed: on_connect rc==0
-    Subscribed --> WaitMessage
-    WaitMessage --> MessageReceived: on_message
+### Schema
 
-    MessageReceived --> ParseJSON
-    ParseJSON --> CheckTopic: valid JSON
-    ParseJSON --> [*]: invalid (silent)
-
-    CheckTopic --> DataMsg: topic starts with IOT_DB/DAT
-    CheckTopic --> DiagMsg: topic starts with IOT_DB/DIAG
-    CheckTopic --> [*]: unknown topic
-
-    DataMsg --> CheckSaveFlag
-    CheckSaveFlag --> HasProj: dS in (S,s,Y,y,1)
-    CheckSaveFlag --> [*]: no save flag
-
-    HasProj --> CallGetOrCreate: dPJ may be empty
-    CallGetOrCreate --> UpdateDevice
-    UpdateDevice --> HasNonEmptyPJ: dPJ non-empty?
-    HasNonEmptyPJ --> CreateDataTable: yes
-    HasNonEmptyPJ --> LogDiscard: no (data discarded)
-
-    CreateDataTable --> AddDynamicColsData
-    AddDynamicColsData --> InsertDataRow
-    InsertDataRow --> CommitData
-
-    DiagMsg --> HasDGT
-    HasDGT --> CallGetDeviceID: dDGT present
-    HasDGT --> LogWarningDGT: missing dDGT
-    CallGetDeviceID --> CreateDiagTable
-    CreateDiagTable --> AddDynamicColsDiag
-    AddDynamicColsDiag --> InsertDiagRow
-    InsertDiagRow --> CommitDiag
-
-    CommitData --> WaitMessage
-    CommitDiag --> WaitMessage
-    LogDiscard --> WaitMessage
-    LogWarningDGT --> WaitMessage
+```sql
+CREATE TABLE DEVICE_CONN (
+    conn_id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    devID SMALLINT UNSIGNED NOT NULL,
+    connected_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    last_msg_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    disconnected_ts TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (conn_id),
+    INDEX (devID, last_msg_ts)
+);
 ```
 
-## Requirements for Dynamic Table Creation
+### Query examples
 
-The bridge can create tables and columns of **any name** as long as:
+**Current active connections** (devices still sending):
 
-- The identifier (project ID or diagnostic type) consists of alphanumeric characters and underscores.
-  Other characters are stripped; if the result is empty, an error is logged.
-- The JSON field names (except reserved ones) are sanitised (`[^A-Za-z0-9_]` replaced with `_`).
-- Column names are limited to 64 characters (MySQL limit). The bridge does not enforce this; very long JSON keys may cause errors.
+```sql
+SELECT d.devName, c.* FROM DEVICE_CONN c
+JOIN DEVICES d ON c.devID = d.devID
+WHERE c.disconnected_ts IS NULL;
+```
 
-### Data types assigned automatically
+**Connection history for a device**:
 
-| JSON value type | SQL column type |
-|----------------|----------------|
-| boolean        | `TINYINT(1)`    |
-| integer        | `BIGINT`        |
-| float          | `DECIMAL(20,10)`|
-| string         | `VARCHAR(255)`  |
-| other          | `VARCHAR(255)`  |
+```sql
+SELECT * FROM DEVICE_CONN WHERE devID = 1 ORDER BY connected_ts DESC;
+```
 
-These types are **fixed** when the column is first created. Subsequent messages with different types may cause truncation or errors (logged in `E_LOG`), but the column type will not change.
+**Devices that haven't sent a message in the last hour** (i.e., the active connection’s `last_msg_ts` is old):
 
-### Creating a new type of table
+```sql
+SELECT d.devName, c.last_msg_ts
+FROM DEVICE_CONN c JOIN DEVICES d ON c.devID = d.devID
+WHERE c.disconnected_ts IS NULL
+  AND c.last_msg_ts < NOW() - INTERVAL 1 HOUR;
+```
 
-- **New project table** (`dt_XXXX`): send a data message with `dPJ` = `"XXXX"` (any alphanumeric string) and `dS` = `"S"`. The bridge creates the table and stores the data.
-- **New diagnostic table** (`dia_YYYY`): send a diagnostic message with `dDGT` = `"YYYY"`. The bridge creates the table and stores the data.
+---
+
+## Database Schema Overview
+
+| Table | Purpose |
+|-------|---------|
+| `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
+| `dt_<projectID>` | Dynamic tables for sensor data (once per project) |
+| `dia_<diagnostic_type>` | Dynamic tables for diagnostic data |
+| `DEVICE_CONN` | Connection sessions (first/last message timestamps per connection) |
+| `E_LOG` | Error log (data type mismatches, truncation, etc.) |
+
+---
 
 ## Installing as a Systemd Service
 
-1. Create an environment file (see above) at `/etc/mqtt2db/env`.
+1. Create the environment file (see above).
 2. Create the service file `/etc/systemd/system/mqtt2db.service`:
 
 ```ini
@@ -217,17 +191,49 @@ sudo systemctl enable mqtt2db.service
 sudo systemctl start mqtt2db.service
 ```
 
-## Troubleshooting
+---
 
-| Problem | Check |
-|---------|-------|
-| Bridge won’t start | `sudo journalctl -u mqtt2db.service -n 50` |
-| MQTT connection fails | Verify `MQTT_BROKER`, `MQTT_PORT`, TLS cert path, username/password. |
-| Data not saved | Ensure `dS` is present and valid, `dPJ` non‑empty. |
-| Diagnostic not saved | Ensure `dDGT` is present. |
-| Column creation fails | Check MariaDB permissions: user needs `ALTER` and `CREATE`. |
-| Data truncation errors | See `E_LOG` table. Increase column size manually if needed. |
+## Logging
+
+- The service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
+- Errors are also written to the `E_LOG` table in MariaDB.
+- Connection timeouts and session creations are logged at `DEBUG` level.
+
+To view debug logs, set `LOG_LEVEL=DEBUG` in the environment file and restart.
 
 ---
 
-*Documentation version 3.1 – includes mermaid diagrams for flow and sequence.*
+## Customising the Session Timeout
+
+In the Python script, find the line:
+
+```python
+SESSION_TIMEOUT_MINUTES = 30
+```
+
+Change the value (in minutes) and restart the service.
+
+To make it configurable via environment variable (optional), replace with:
+
+```python
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
+```
+
+Then add `SESSION_TIMEOUT_MINUTES=45` to the environment file.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause / check |
+|---------|----------------------|
+| Service won’t start | `sudo journalctl -u mqtt2db.service -n 50` |
+| MQTT connection fails | Verify `MQTT_BROKER`, `MQTT_PORT`, TLS cert path, credentials. |
+| Data not saved | `dS` missing/invalid? `dPJ` empty? Topic not under `IOT_DB/DAT/`? |
+| Diagnostic not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
+| Connection table not updating | Check that `DEVICE_CONN` exists; verify script version. |
+| Timeout not closing sessions | The timeout is checked only when a new message arrives. Older sessions remain open if the device stops sending. |
+
+---
+
+*Documentation version 4.0 – connection tracking edition, compatible with the bridge script that includes `DEVICE_CONN` and session timeouts.*
