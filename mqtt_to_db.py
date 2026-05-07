@@ -29,19 +29,18 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 RESERVED_KEYS_DAT = {"dNM", "dPJ", "dS"}
 RESERVED_KEYS_DIAG = {"dNM", "dDGT"}
 
-# Session timeout (minutes)
+# Session timeout (minutes) – only used as fallback if disconnect not seen
 SESSION_TIMEOUT_MINUTES = 30
 
 # Global database connection and column cache
 db_conn = None
 column_cache = set()
 
-# Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper()),
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- Helper functions ----------
+# ---------- Helper functions (unchanged) ----------
 def sanitize_name(raw, prefix):
     clean = re.sub(r'[^A-Za-z0-9_]', '', raw)
     if not clean:
@@ -127,38 +126,48 @@ def insert_data_row(conn, table_name, dev_id, ts, data_fields):
             logger.error(f"Insert error: {e}")
             raise
 
-def get_or_create_connection(conn, dev_id):
-    """Return current open connection ID for the device, or create a new one.
-       Also updates last_msg_ts for that connection."""
-    with conn.cursor() as cursor:
-        # Look for an open connection (disconnected_ts IS NULL)
-        cursor.execute("""
-            SELECT conn_id, last_msg_ts FROM DEVICE_CONN
-            WHERE devID = %s AND disconnected_ts IS NULL
-            ORDER BY last_msg_ts DESC LIMIT 1
-        """, (dev_id,))
-        row = cursor.fetchone()
-        now = datetime.now()
-        if row:
-            conn_id, last_msg = row
-            # If last message is older than timeout, close this session and create a new one
-            if now - last_msg > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
-                cursor.execute("UPDATE DEVICE_CONN SET disconnected_ts = %s WHERE conn_id = %s",
-                               (now, conn_id))
-                conn.commit()
-                row = None
-        if not row:
-            # Create a new connection session
-            cursor.execute("INSERT INTO DEVICE_CONN (devID, connected_ts, last_msg_ts) VALUES (%s, %s, %s)",
-                           (dev_id, now, now))
-            conn_id = cursor.lastrowid
+# ---------- Connection tracking functions (added) ----------
+def close_device_connection(conn, dev_name):
+    """Mark the current open connection as disconnected"""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT devID FROM DEVICES WHERE devName = %s", (dev_name,))
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Device '{dev_name}' not found, cannot close connection")
+                return
+            dev_id = row[0]
+            cursor.execute("""
+                UPDATE DEVICE_CONN
+                SET disconnected_ts = NOW()
+                WHERE devID = %s AND disconnected_ts IS NULL
+            """, (dev_id,))
             conn.commit()
-        else:
-            conn_id = row[0]
-        # Update last_msg_ts for this connection (always)
-        cursor.execute("UPDATE DEVICE_CONN SET last_msg_ts = %s WHERE conn_id = %s", (now, conn_id))
-        conn.commit()
-        return conn_id
+            if cursor.rowcount > 0:
+                logger.info(f"Closed connection for device {dev_name}")
+    except Exception as e:
+        logger.error(f"Error closing connection for {dev_name}: {e}")
+        conn.rollback()
+
+def create_device_connection(conn, dev_name):
+    """Create a new connection record for a device, storing current projID"""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT devID, devPROJID FROM DEVICES WHERE devName = %s", (dev_name,))
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Device '{dev_name}' not found, cannot create connection")
+                return
+            dev_id, proj_id = row
+            cursor.execute("""
+                INSERT INTO DEVICE_CONN (devID, projID, connected_ts, last_msg_ts, disconnected_ts)
+                VALUES (%s, %s, NOW(), NOW(), NULL)
+            """, (dev_id, proj_id))
+            conn.commit()
+            logger.info(f"New connection created for device {dev_name}")
+    except Exception as e:
+        logger.error(f"Error creating connection for {dev_name}: {e}")
+        conn.rollback()
 
 def get_db_connection():
     global db_conn
@@ -178,12 +187,78 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info(f"Connected to MQTT broker, subscribing to {MQTT_TOPIC}")
         client.subscribe(MQTT_TOPIC)
+        # Also subscribe to $SYS/broker/log/N for connection events
+        client.subscribe("$SYS/broker/log/N")
+        logger.info("Subscribed to $SYS/broker/log/N for connection tracking")
     else:
         logger.error(f"MQTT connection failed with code {rc}")
 
 def on_disconnect(client, userdata, rc, properties=None, reason_code=None):
     logger.warning(f"Disconnected (rc={rc}, reason={reason_code})")
 
+def on_message(client, userdata, msg):
+    topic = msg.topic
+    payload = msg.payload.decode('utf-8').strip()
+
+    # Handle $SYS/broker/log/N messages for connection tracking
+    if topic == "$SYS/broker/log/N":
+        logger.debug(f"SYS log: {payload}")
+        # Parse connection: "... as ESP_32:97:54 (p5,..."
+        conn_match = re.search(r'as (\S+) \(', payload)
+        if conn_match:
+            client_id = conn_match.group(1)
+            logger.info(f"Device '{client_id}' connected")
+            try:
+                db = get_db_connection()
+                create_device_connection(db, client_id)
+            except Exception as e:
+                logger.error(f"Failed to process connect event: {e}")
+            return
+        # Parse disconnection: "Client ESP_32:97:54 disconnected."
+        disconn_match = re.search(r'Client (\S+) disconnected\.', payload)
+        if disconn_match:
+            client_id = disconn_match.group(1)
+            logger.info(f"Device '{client_id}' disconnected")
+            try:
+                db = get_db_connection()
+                close_device_connection(db, client_id)
+            except Exception as e:
+                logger.error(f"Failed to process disconnect event: {e}")
+            return
+        # Not a connection/disconnection line – ignore
+        return
+
+    # Otherwise, handle normal data/diagnostic messages (original logic)
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Silently ignore invalid JSON
+        return
+
+    # Determine if it's DAT or DIAG
+    if topic.startswith("IOT_DB/DAT"):
+        msg_type = "DAT"
+    elif topic.startswith("IOT_DB/DIAG"):
+        msg_type = "DIAG"
+    else:
+        return
+
+    dev_name = data.get('dNM')
+    if not dev_name:
+        logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
+        return
+
+    db = None
+    try:
+        db = get_db_connection()
+        if msg_type == "DAT":
+            process_data(db, data, topic, dev_name)
+        else:
+            process_diagnostics(db, data, topic, dev_name)
+    except Exception as e:
+        logger.error(f"Device: {dev_name} – {str(e)}")
+
+# ---------- Data and diagnostic processing (unchanged except removed old connection timeout logic) ----------
 def process_diagnostics(conn, data, topic, dev_name):
     diag_type = data.get('dDGT')
     if not diag_type:
@@ -197,9 +272,19 @@ def process_diagnostics(conn, data, topic, dev_name):
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id} (diagnostic only)")
 
-    # Update connection session
-    conn_id = get_or_create_connection(conn, dev_id)
-    logger.debug(f"Connection ID {conn_id} last_msg_ts updated")
+    # Note: connection tracking is now done via $SYS log, not here
+    # The `last_msg_ts` of the active connection will be updated separately by the $SYS connect/disconnect logic.
+    # However, to keep `last_msg_ts` accurate (updating on every message), we can add that here.
+    # Let's add a small update to touch the last_msg_ts of the active connection.
+    try:
+        with conn.cursor() as cursor2:
+            cursor2.execute("""
+                UPDATE DEVICE_CONN SET last_msg_ts = NOW()
+                WHERE devID = %s AND disconnected_ts IS NULL
+            """, (dev_id,))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"Could not update last_msg_ts: {e}")
 
     table_name = sanitize_name(diag_type, "dia")
     ensure_data_table(conn, table_name)
@@ -240,9 +325,16 @@ def process_data(conn, data, topic, dev_name):
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id}")
 
-    # Update connection session
-    conn_id = get_or_create_connection(conn, dev_id)
-    logger.debug(f"Connection ID {conn_id} last_msg_ts updated")
+    # Update last_msg_ts of the active connection (if any)
+    try:
+        with conn.cursor() as cursor2:
+            cursor2.execute("""
+                UPDATE DEVICE_CONN SET last_msg_ts = NOW()
+                WHERE devID = %s AND disconnected_ts IS NULL
+            """, (dev_id,))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"Could not update last_msg_ts: {e}")
 
     if proj_id:
         table_name = sanitize_name(proj_id, "dt")
@@ -264,35 +356,7 @@ def process_data(conn, data, topic, dev_name):
     else:
         logger.info(f"No project ID for {dev_name} – data discarded (device record updated)")
 
-def on_message(client, userdata, msg):
-    try:
-        payload = msg.payload.decode('utf-8')
-        data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return
-
-    topic = msg.topic
-    if topic.startswith("IOT_DB/DAT"):
-        msg_type = "DAT"
-    elif topic.startswith("IOT_DB/DIAG"):
-        msg_type = "DIAG"
-    else:
-        return
-
-    dev_name = data.get('dNM')
-    if not dev_name:
-        logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
-        return
-
-    try:
-        conn = get_db_connection()
-        if msg_type == "DAT":
-            process_data(conn, data, topic, dev_name)
-        else:
-            process_diagnostics(conn, data, topic, dev_name)
-    except Exception as e:
-        logger.error(f"Device: {dev_name} – {str(e)}")
-
+# ---------- Main ----------
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
     global db_conn

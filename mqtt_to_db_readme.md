@@ -1,9 +1,9 @@
-# MQTT to MariaDB Bridge – Connection Tracking Edition
+# MQTT to MariaDB Bridge – Integrated Connection Tracking
 
 ## Overview
 
 This service subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
-It also tracks **device connection sessions**: each time a device (re)connects (or resumes sending after a timeout), a new session is created with a unique connection ID. That session’s `last_msg_ts` is updated on every subsequent message, and the session is automatically closed after a defined inactivity period.
+It also **tracks device connection sessions in real time** by subscribing to Mosquitto’s `$SYS/broker/log/N` topic. When a client connects or disconnects, the `DEVICE_CONN` table is updated immediately – no separate tracker service is needed.
 
 Two message types are supported:
 
@@ -18,6 +18,8 @@ Two message types are supported:
 |-----------------------------|-----------------------------------------------------------|------------------------------------------|
 | `IOT_DB/DAT/#`              | Sensor data (e.g., temperature, humidity)                 | `dNM`, `dPJ`, `dS`                       |
 | `IOT_DB/DIAG/#`             | Diagnostic data (e.g., CPU temperature, memory usage)     | `dNM`, `dDGT`                            |
+
+The service also subscribes to `$SYS/broker/log/N` for real‑time client connection/disconnection events.
 
 ---
 
@@ -75,7 +77,7 @@ All other fields are stored as dynamic columns (prefixed with `d_`). The device�
 
 All settings are read from environment variables. Create a file `/etc/mqtt2db/env`:
 
-```
+```env
 MQTT_BROKER=raspi00
 MQTT_PORT=8883
 MQTT_USER=edolis
@@ -98,14 +100,32 @@ After changes, restart the service: `sudo systemctl restart mqtt2db.service`.
 
 ---
 
+## Mosquitto Configuration for Connection Tracking
+
+To enable the `$SYS/broker/log/N` topic, add the following line to your `/etc/mosquitto/mosquitto.conf`:
+
+```ini
+log_dest topic
+```
+
+If you already have `log_type all`, no further changes are needed. Restart Mosquitto:
+
+```bash
+sudo systemctl restart mosquitto
+```
+
+This allows the bridge to receive real‑time connect/disconnect events.
+
+---
+
 ## Connection Tracking – Table `DEVICE_CONN`
 
-The bridge maintains a table `DEVICE_CONN` that records each device’s connection session. A new session is created when:
+The bridge maintains a table `DEVICE_CONN` that records each device’s connection session:
 
-- The device sends its first message after the service starts, or
-- The device resumes sending after an inactivity period longer than `SESSION_TIMEOUT_MINUTES` (default 30 minutes).
-
-Every message updates the `last_msg_ts` of the current active session. When the timeout expires, the session is closed (`disconnected_ts` set) and the next message opens a new session.
+- **`connected_ts`** – when the device connected (first message after a gap or broker‑reported connect).
+- **`last_msg_ts`** – updated on every sensor or diagnostic message.
+- **`disconnected_ts`** – set when the device disconnects (from `$SYS/broker/log/N`).
+- **`projID`** – the project ID the device had at the time of connection (snapshot).
 
 ### Schema
 
@@ -113,6 +133,7 @@ Every message updates the `last_msg_ts` of the current active session. When the 
 CREATE TABLE DEVICE_CONN (
     conn_id INT UNSIGNED NOT NULL AUTO_INCREMENT,
     devID SMALLINT UNSIGNED NOT NULL,
+    projID VARCHAR(251) NULL,
     connected_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
     last_msg_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
     disconnected_ts TIMESTAMP NULL DEFAULT NULL,
@@ -121,30 +142,48 @@ CREATE TABLE DEVICE_CONN (
 );
 ```
 
+### View `vw_CONN_LOG` – human‑readable connection log
+
+```sql
+CREATE OR REPLACE VIEW vw_CONN_LOG AS
+WITH uptime_seconds AS (
+    SELECT
+        c.conn_id,
+        c.devID,
+        c.projID,
+        c.connected_ts,
+        c.last_msg_ts,
+        c.disconnected_ts,
+        TIMESTAMPDIFF(SECOND, c.connected_ts, IFNULL(c.disconnected_ts, NOW())) AS uptime_sec
+    FROM DEVICE_CONN c
+)
+SELECT
+    u.conn_id,
+    d.devName,
+    u.projID,
+    u.connected_ts,
+    u.last_msg_ts,
+    u.disconnected_ts,
+    CONCAT(
+        FLOOR(u.uptime_sec / 86400), 'd ',
+        FLOOR((u.uptime_sec % 86400) / 3600), 'h ',
+        FLOOR((u.uptime_sec % 3600) / 60), 'm'
+    ) AS uptime_str
+FROM uptime_seconds u
+JOIN DEVICES d ON u.devID = d.devID
+ORDER BY u.connected_ts DESC;
+```
+
 ### Query examples
 
-**Current active connections** (devices still sending):
-
-```sql
-SELECT d.devName, c.* FROM DEVICE_CONN c
-JOIN DEVICES d ON c.devID = d.devID
-WHERE c.disconnected_ts IS NULL;
-```
-
-**Connection history for a device**:
-
-```sql
-SELECT * FROM DEVICE_CONN WHERE devID = 1 ORDER BY connected_ts DESC;
-```
-
-**Devices that haven't sent a message in the last hour** (i.e., the active connection’s `last_msg_ts` is old):
-
-```sql
-SELECT d.devName, c.last_msg_ts
-FROM DEVICE_CONN c JOIN DEVICES d ON c.devID = d.devID
-WHERE c.disconnected_ts IS NULL
-  AND c.last_msg_ts < NOW() - INTERVAL 1 HOUR;
-```
+- **Current active connections**:
+  ```sql
+  SELECT * FROM vw_CONN_LOG WHERE disconnected_ts IS NULL;
+  ```
+- **History for a device**:
+  ```sql
+  SELECT * FROM vw_CONN_LOG WHERE devName = 'ESP_32:97:54';
+  ```
 
 ---
 
@@ -155,7 +194,7 @@ WHERE c.disconnected_ts IS NULL
 | `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
 | `dt_<projectID>` | Dynamic tables for sensor data (once per project) |
 | `dia_<diagnostic_type>` | Dynamic tables for diagnostic data |
-| `DEVICE_CONN` | Connection sessions (first/last message timestamps per connection) |
+| `DEVICE_CONN` | Connection sessions (real‑time tracking via `$SYS` logs) |
 | `E_LOG` | Error log (data type mismatches, truncation, etc.) |
 
 ---
@@ -167,7 +206,7 @@ WHERE c.disconnected_ts IS NULL
 
 ```ini
 [Unit]
-Description=MQTT to MariaDB Data Saver
+Description=MQTT to MariaDB Data Saver (with connection tracking)
 After=network.target mariadb.service mosquitto.service
 
 [Service]
@@ -197,29 +236,9 @@ sudo systemctl start mqtt2db.service
 
 - The service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
 - Errors are also written to the `E_LOG` table in MariaDB.
-- Connection timeouts and session creations are logged at `DEBUG` level.
+- Connection events (connect/disconnect) are logged at `INFO` level when detected via `$SYS/broker/log/N`.
 
 To view debug logs, set `LOG_LEVEL=DEBUG` in the environment file and restart.
-
----
-
-## Customising the Session Timeout
-
-In the Python script, find the line:
-
-```python
-SESSION_TIMEOUT_MINUTES = 30
-```
-
-Change the value (in minutes) and restart the service.
-
-To make it configurable via environment variable (optional), replace with:
-
-```python
-SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
-```
-
-Then add `SESSION_TIMEOUT_MINUTES=45` to the environment file.
 
 ---
 
@@ -231,9 +250,9 @@ Then add `SESSION_TIMEOUT_MINUTES=45` to the environment file.
 | MQTT connection fails | Verify `MQTT_BROKER`, `MQTT_PORT`, TLS cert path, credentials. |
 | Data not saved | `dS` missing/invalid? `dPJ` empty? Topic not under `IOT_DB/DAT/`? |
 | Diagnostic not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
-| Connection table not updating | Check that `DEVICE_CONN` exists; verify script version. |
-| Timeout not closing sessions | The timeout is checked only when a new message arrives. Older sessions remain open if the device stops sending. |
+| Connection table not updating | Ensure `log_dest topic` is set in Mosquitto and restarted. Subscribe manually: `mosquitto_sub -t '$SYS/broker/log/N'` |
+| Disconnections not logged | Check Mosquitto log format; the script expects `Client <id> disconnected.` – adjust regex if needed. |
 
 ---
 
-*Documentation version 4.0 – connection tracking edition, compatible with the bridge script that includes `DEVICE_CONN` and session timeouts.*
+*Documentation version 5.0 – integrated connection tracking, no separate tracker service.*
