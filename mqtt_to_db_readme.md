@@ -3,21 +3,21 @@
 ## Overview
 
 This service subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
-It also **tracks device connection sessions in real time** by subscribing to Mosquitto’s `$SYS/broker/log/N` topic. When a client connects or disconnects, the `DEVICE_CONN` table is updated immediately – no separate tracker service is needed.
+It also **tracks device connection sessions in real time** by subscribing to Mosquitto’s `$SYS/broker/log/N` topic. When a client connects or disconnects, the `DEVICE_CONN` table is updated immediately.
 
 Two message types are supported:
 
 - **Data messages** (`IOT_DB/DAT/...`) – require `dNM`, `dPJ`, `dS` fields. Saved into project‑specific tables `dt_<projectID>`.
-- **Diagnostic messages** (`IOT_DB/DIAG/...`) – require `dNM`, `dDGT` fields. Saved into diagnostic tables `dia_<diagnostic_type>`.
+- **Diagnostic messages** (`IOT_DB/DIAG/...`) – store diagnostic information. A root diagnostic block is **always saved**; additional blocks inside a `diagnostics` array can be saved conditionally.
 
 ---
 
 ## MQTT Topics
 
-| Topic pattern               | Purpose                                                   | Required JSON fields                     |
-|-----------------------------|-----------------------------------------------------------|------------------------------------------|
-| `IOT_DB/DAT/#`              | Sensor data (e.g., temperature, humidity)                 | `dNM`, `dPJ`, `dS`                       |
-| `IOT_DB/DIAG/#`             | Diagnostic data (e.g., CPU temperature, memory usage)     | `dNM`, `dDGT`                            |
+| Topic pattern          | Purpose                                                   | Required fields                     |
+|-----------------------|-----------------------------------------------------------|-------------------------------------|
+| `IOT_DB/DAT/#`        | Sensor data (e.g., temperature, humidity)                 | `dNM`, `dPJ`, `dS`                  |
+| `IOT_DB/DIAG/#`       | Diagnostic data (e.g., system health, memory stats)       | `dNM`, `dDGT` (root block)          |
 
 The service also subscribes to `$SYS/broker/log/N` for real‑time client connection/disconnection events.
 
@@ -31,11 +31,11 @@ The service also subscribes to `$SYS/broker/log/N` for real‑time client connec
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name (unique identifier, max 12 chars) | `"ESP_41:2F:6C"` |
-| `dPJ` | Project ID (e.g., `"P001"`). If empty or missing, **no sensor data is saved** – only device record is updated. | `"P001"` |
-| `dS`  | Save flag – one of: `"S"`, `"s"`, `"Y"`, `"y"`, `"1"`. Otherwise message is ignored. | `"S"` |
+| `dNM` | Device name (unique identifier) | `"ESP_41:2F:6C"` |
+| `dPJ` | Project ID – if empty, **no sensor data is saved** | `"P001"` |
+| `dS`  | Save flag (must be `S`, `s`, `Y`, `y`, `1`) | `"S"` |
 
-Any additional key‑value pairs are stored as dynamic columns prefixed with `d_` (e.g., `temperature` → `d_temperature`).
+All other keys that start with a configured prefix (default `"d_"`) are stored as dynamic columns (prefix stripped). Other keys are ignored.
 
 **Example:**
 
@@ -44,116 +44,137 @@ Any additional key‑value pairs are stored as dynamic columns prefixed with `d_
   "dNM": "ESP_ABC123",
   "dPJ": "P002",
   "dS": "S",
-  "temperature": 23.5,
-  "humidity": 60
+  "d_temperature": 23.5,
+  "d_humidity": 60
 }
 ```
-## Dynamic Field Prefixes
 
-The bridge only stores JSON keys that start with one of the prefixes defined in `DYNAMIC_FIELD_PREFIXES`. The prefix is stripped, and the remaining part becomes the column name.
+This creates/inserts into `dt_P002` with columns `temperature` and `humidity`.
 
-Default: `DYNAMIC_FIELD_PREFIXES = ["d_"]`
-
-Example:
-- JSON: `{"d_temperature": 23.5}` → column: `temperature`
-- JSON: `{"temperature": 23.5}` → ignored (no prefix)
-
-You can add multiple prefixes, e.g., `["d_", "s_"]`. To change, edit the script and restart the service.
+---
 
 ### Diagnostic Messages (`IOT_DB/DIAG/#`)
 
-**Required fields:**
+Diagnostic messages can contain a **root block** (always saved) and **additional blocks** inside a `diagnostics` array (saved only if they have `dS` set to a valid save flag).
+
+#### Root block (always saved)
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name (unique identifier) | `"ESP_41:2F:6C"` |
-| `dDGT` | Diagnostic type – table name `dia_<type>` | `"cpu"`, `"memory"` |
+| `dNM` | Device name | `"ESP_32:97:54"` |
+| `dDGT` | Diagnostic type – table name `dia_<type>` | `"DTF"` |
+| (other fields) | Any keys with the configured prefix become dynamic columns | `d_UPT: "0d11h59m"` |
 
-All other fields are stored as dynamic columns (prefixed with `d_`). The device’s project ID (`devPROJID`) is **not** modified.
+**Note:** The root block does **not** require a `dS` field – it is always stored.
 
-**Example:**
+#### Additional blocks (inside `diagnostics` array)
+
+Each entry in the array is a JSON object containing:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `dDGT` | Child diagnostic type – table name `dia_<parent>_<child>` | `"DTM"` |
+| `dS`  | Save flag – if not set or invalid, the entry is skipped | `"S"` |
+| (other fields) | Dynamic fields (prefix stripped) become columns in the child table | `d_hfree: 219240` |
+
+#### Example: Single message with root + one additional diagnostic
 
 ```json
 {
-  "dNM": "ESP_ABC123",
-  "dDGT": "cpu",
-  "temperature": 65.2,
-  "load": 0.75
+  "dNM": "ESP_32:97:54",
+  "dDGT": "DTF",
+  "d_UPS": 43168,
+  "d_UPT": "0d11h59m",
+  "d_rssi_dbm": -70,
+  "d_rssi_ID": "Edolis",
+  "diagnostics": [
+    {
+      "dDGT": "DTM",
+      "dS": "S",
+      "d_hfree": 219240,
+      "d_hlarge": 172032
+    }
+  ]
 }
 ```
 
----
+**What happens:**
 
-## Configuration (Environment Variables)
+- The root block is always saved: a new row is inserted into `dia_DTF` with the dynamic fields `UPS`, `UPT`, `rssi_dbm`, `rssi_ID`.
+- The additional block is saved **only if** `dS` is `"S"`. A new row is inserted into `dia_DTF_DTM` with a `parent_id` column that stores the `id` of the root row.
 
-All settings are read from environment variables. Create a file `/etc/mqtt2db/env`:
+#### Example: Multiple additional diagnostics (some may be skipped)
 
-```env
-MQTT_BROKER=raspi00
-MQTT_PORT=8883
-MQTT_USER=usr
-MQTT_PASS=your_mqtt_password
-MQTT_TLS_ENABLED=true
-MQTT_TLS_CA_CERTS=/etc/mosquitto/certs/ca.crt
-DB_HOST=localhost
-DB_USER=usrBr
-DB_PASS=password
-DB_NAME=IOT_DB
-LOG_LEVEL=INFO
+```json
+{
+  "dNM": "ESP_32:97:54",
+  "dDGT": "DTF",
+  "d_UPS": 43168,
+  "diagnostics": [
+    {
+      "dDGT": "DTM",
+      "dS": "S",
+      "d_hfree": 219240,
+      "note": "This field has no d_ prefix and will be ignored"
+    },
+    {
+      "dDGT": "TMP",
+      "dS": "N",
+      "d_temp": 25.5
+    }
+  ]
+}
 ```
 
-### Changing Username/Password
-
-- MQTT authentication: edit `MQTT_USER` and `MQTT_PASS`.
-- Database authentication: edit `DB_USER` and `DB_PASS`.
-
-After changes, restart the service: `sudo systemctl restart mqtt2db.service`.
-
----
-
-## Mosquitto Configuration for Connection Tracking
-
-To enable the `$SYS/broker/log/N` topic, add the following line to your `/etc/mosquitto/mosquitto.conf`:
-
-```ini
-log_dest topic
-```
-
-If you already have `log_type all`, no further changes are needed. Restart Mosquitto:
-
-```bash
-sudo systemctl restart mosquitto
-```
-
-This allows the bridge to receive real‑time connect/disconnect events.
+- The first entry (`DTM`) is saved because `dS` is `"S"`.
+- The second entry (`TMP`) is **not saved** because `dS` is not a valid save flag.
 
 ---
 
-## Connection Tracking – Table `DEVICE_CONN`
+## Database Schema
 
-The bridge maintains a table `DEVICE_CONN` that records each device’s connection session:
+### Diagnostic Tables
 
-- **`connected_ts`** – when the device connected (first message after a gap or broker‑reported connect).
-- **`last_msg_ts`** – updated on every sensor or diagnostic message.
-- **`disconnected_ts`** – set when the device disconnects (from `$SYS/broker/log/N`).
-- **`projID`** – the project ID the device had at the time of connection (snapshot).
+#### Parent table (e.g., `dia_DTF`)
 
-### Schema
+Created automatically when the first root diagnostic of type `DTF` arrives.
 
 ```sql
-CREATE TABLE DEVICE_CONN (
-    conn_id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    devID SMALLINT UNSIGNED NOT NULL,
-    projID VARCHAR(251) NULL,
-    connected_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-    last_msg_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-    disconnected_ts TIMESTAMP NULL DEFAULT NULL,
-    PRIMARY KEY (conn_id),
-    INDEX (devID, last_msg_ts)
+CREATE TABLE dia_DTF (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    deviceID SMALLINT UNSIGNED NOT NULL,
+    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    -- dynamic columns (e.g., UPS, UPT, rssi_dbm, ...)
+    PRIMARY KEY (id)
 );
 ```
 
-### View `vw_CONN_LOG` – human‑readable connection log
+#### Child table (e.g., `dia_DTF_DTM`)
+
+Created automatically when the first additional diagnostic of type `DTM` arrives under parent `DTF`.
+
+```sql
+CREATE TABLE dia_DTF_DTM (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    deviceID SMALLINT UNSIGNED NOT NULL,
+    parent_id INT UNSIGNED NOT NULL,
+    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    -- dynamic columns (e.g., hfree, hlarge, ...)
+    PRIMARY KEY (id)
+);
+```
+
+- `parent_id` references the `id` in `dia_DTF`, linking child data to the parent message.
+
+### Other Tables
+
+| Table | Purpose |
+|-------|---------|
+| `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
+| `DEVICE_CONN` | Connection sessions (tracked via `$SYS` logs) |
+| `E_LOG` | Error log |
+
+### View `vw_CONN_LOG` for connection history
 
 ```sql
 CREATE OR REPLACE VIEW vw_CONN_LOG AS
@@ -185,28 +206,63 @@ JOIN DEVICES d ON u.devID = d.devID
 ORDER BY u.connected_ts DESC;
 ```
 
-### Query examples
+### Query example: join parent and child tables
 
-- **Current active connections**:
-  ```sql
-  SELECT * FROM vw_CONN_LOG WHERE disconnected_ts IS NULL;
-  ```
-- **History for a device**:
-  ```sql
-  SELECT * FROM vw_CONN_LOG WHERE devName = 'ESP_32:97:54';
-  ```
+To retrieve child diagnostic data along with the parent’s timestamp:
+
+```sql
+SELECT
+    p.ts AS parent_ts,
+    c.*
+FROM dia_DTF_DTM c
+JOIN dia_DTF p ON c.parent_id = p.id
+WHERE p.deviceID = 1;
+```
 
 ---
 
-## Database Schema Overview
+## Configuration (Environment Variables)
 
-| Table | Purpose |
-|-------|---------|
-| `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
-| `dt_<projectID>` | Dynamic tables for sensor data (once per project) |
-| `dia_<diagnostic_type>` | Dynamic tables for diagnostic data |
-| `DEVICE_CONN` | Connection sessions (real‑time tracking via `$SYS` logs) |
-| `E_LOG` | Error log (data type mismatches, truncation, etc.) |
+All settings are read from environment variables. Create a file `/etc/mqtt2db/env`:
+
+```env
+MQTT_BROKER=raspi00
+MQTT_PORT=8883
+MQTT_USER=your_mqtt_username
+MQTT_PASS=your_mqtt_password
+MQTT_TLS_ENABLED=true
+MQTT_TLS_CA_CERTS=/etc/mosquitto/certs/ca.crt
+DB_HOST=localhost
+DB_USER=your_db_user
+DB_PASS=your_db_password
+DB_NAME=IOT_DB
+LOG_LEVEL=INFO
+```
+
+### Changing Prefixes or Array Field Name
+
+Inside the Python script you can modify:
+
+- `DYNAMIC_FIELD_PREFIXES = ["d_"]` – add more prefixes if needed.
+- `DIAG_ARRAY_FIELD = "diagnostics"` – rename the array key.
+
+After changes, restart the service.
+
+---
+
+## Mosquitto Configuration for Connection Tracking
+
+To enable the `$SYS/broker/log/N` topic, add the following line to your `/etc/mosquitto/mosquitto.conf`:
+
+```ini
+log_dest topic
+```
+
+Restart Mosquitto:
+
+```bash
+sudo systemctl restart mosquitto
+```
 
 ---
 
@@ -217,7 +273,7 @@ ORDER BY u.connected_ts DESC;
 
 ```ini
 [Unit]
-Description=MQTT to MariaDB Data Saver (with connection tracking)
+Description=MQTT to MariaDB Data Saver with diagnostic parent‑child tables
 After=network.target mariadb.service mosquitto.service
 
 [Service]
@@ -245,11 +301,11 @@ sudo systemctl start mqtt2db.service
 
 ## Logging
 
-- The service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
-- Errors are also written to the `E_LOG` table in MariaDB.
-- Connection events (connect/disconnect) are logged at `INFO` level when detected via `$SYS/broker/log/N`.
+- Service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
+- Errors also written to `E_LOG` table.
+- Connection events are logged at `INFO` level.
 
-To view debug logs, set `LOG_LEVEL=DEBUG` in the environment file and restart.
+To view debug logs, set `LOG_LEVEL=DEBUG` in the environment.
 
 ---
 
@@ -260,10 +316,6 @@ To view debug logs, set `LOG_LEVEL=DEBUG` in the environment file and restart.
 | Service won’t start | `sudo journalctl -u mqtt2db.service -n 50` |
 | MQTT connection fails | Verify `MQTT_BROKER`, `MQTT_PORT`, TLS cert path, credentials. |
 | Data not saved | `dS` missing/invalid? `dPJ` empty? Topic not under `IOT_DB/DAT/`? |
-| Diagnostic not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
-| Connection table not updating | Ensure `log_dest topic` is set in Mosquitto and restarted. Subscribe manually: `mosquitto_sub -t '$SYS/broker/log/N'` |
-| Disconnections not logged | Check Mosquitto log format; the script expects `Client <id> disconnected.` – adjust regex if needed. |
-
----
-
-*Documentation version 5.0 – integrated connection tracking, no separate tracker service.*
+| Diagnostic root not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
+| Child diagnostic not saved | Check `dS` in array entry. |
+| Connection table not updating | Ensure `log_dest topic` is set in Mosquitto and restarted. |

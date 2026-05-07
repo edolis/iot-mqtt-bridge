@@ -17,20 +17,23 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "IOT_DB/#")
 MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "true").lower() == "true"
 MQTT_TLS_CA_CERTS = os.getenv("MQTT_TLS_CA_CERTS", "/etc/mosquitto/certs/ca.crt")
-MQTT_USERNAME = os.getenv("MQTT_USER", "edolis")
-MQTT_PASSWORD = os.getenv("MQTT_PASS", "")
+MQTT_USERNAME = os.getenv("MQTT_USER", "your_mqtt_username")
+MQTT_PASSWORD = os.getenv("MQTT_PASS", "your_mqtt_password")
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "pyBridge")
-DB_PASSWORD = os.getenv("DB_PASS", "pyBridgeSpring")
+DB_USER = os.getenv("DB_USER", "your_db_user")
+DB_PASSWORD = os.getenv("DB_PASS", "your_db_password")
 DB_NAME = os.getenv("DB_NAME", "IOT_DB")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Reserved JSON keys
+# Reserved JSON keys for data and diagnostic messages
 RESERVED_KEYS_DAT = {"dNM", "dPJ", "dS"}
 RESERVED_KEYS_DIAG = {"dNM", "dDGT"}
 
 # Dynamic field prefixes – only keys starting with these are stored (prefix stripped)
-DYNAMIC_FIELD_PREFIXES = ["d_"]   # you can add more, e.g., "s_", "v_"
+DYNAMIC_FIELD_PREFIXES = ["d_"]
+
+# Name of the array field that contains additional diagnostic blocks
+DIAG_ARRAY_FIELD = "diagnostics"
 
 # Session timeout (minutes) – only used as fallback if disconnect not seen
 SESSION_TIMEOUT_MINUTES = 30
@@ -39,11 +42,12 @@ SESSION_TIMEOUT_MINUTES = 30
 db_conn = None
 column_cache = set()
 
+# Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper()),
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- Helper functions (unchanged except get_sql_type remains) ----------
+# ---------- Helper functions ----------
 def sanitize_name(raw, prefix):
     clean = re.sub(r'[^A-Za-z0-9_]', '', raw)
     if not clean:
@@ -54,7 +58,7 @@ def get_sql_type(value):
     if isinstance(value, bool):
         return "TINYINT(1)"
     elif isinstance(value, int):
-        return "BIGINT"
+        return "INT"               # was BIGINT – changed to INT for space efficiency
     elif isinstance(value, float):
         return "DECIMAL(20,10)"
     elif isinstance(value, str):
@@ -84,11 +88,12 @@ def add_column_if_not_exists(conn, table_name, column_name, sql_type):
         raise
 
 def ensure_data_table(conn, table_name):
+    """Create parent diagnostic table (without parent_id)"""
     try:
         with conn.cursor() as cursor:
             cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS `{table_name}` (
-                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
                     deviceID SMALLINT UNSIGNED NOT NULL,
                     ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
                     PRIMARY KEY (id),
@@ -99,6 +104,26 @@ def ensure_data_table(conn, table_name):
             logger.info(f"Table {table_name} ready")
     except MySQLError as e:
         logger.error(f"Failed to create table {table_name}: {e}")
+        raise
+
+def ensure_child_table(conn, table_name):
+    """Create child diagnostic table (with parent_id column)"""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS `{table_name}` (
+                    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    deviceID SMALLINT UNSIGNED NOT NULL,
+                    parent_id INT UNSIGNED NOT NULL,
+                    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+                    PRIMARY KEY (id),
+                    INDEX (deviceID, ts)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            conn.commit()
+            logger.info(f"Child table {table_name} ready")
+    except MySQLError as e:
+        logger.error(f"Failed to create child table {table_name}: {e}")
         raise
 
 def log_error(conn, dev_id, ts, message):
@@ -112,24 +137,32 @@ def log_error(conn, dev_id, ts, message):
     except MySQLError as e:
         logger.error(f"Failed to log error: {e}")
 
-def insert_data_row(conn, table_name, dev_id, ts, data_fields):
-    columns = ['deviceID', 'ts'] + [f"`{k}`" for k in data_fields.keys()]
-    placeholders = ['%s'] * (2 + len(data_fields))
-    values = [dev_id, ts] + list(data_fields.values())
-    sql = f"INSERT INTO `{table_name}` ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+def insert_data_row(conn, table_name, dev_id, ts, data_fields, parent_id=None):
+    columns = ['deviceID', 'ts']
+    values = [dev_id, ts]
+    if parent_id is not None:
+        columns.insert(1, 'parent_id')
+        values.insert(1, parent_id)
+    for key, value in data_fields.items():
+        columns.append(f"`{key}`")
+        values.append(value)
+    placeholders = ','.join(['%s'] * len(values))
+    sql = f"INSERT INTO `{table_name}` ({','.join(columns)}) VALUES ({placeholders})"
     try:
         with conn.cursor() as cursor:
             cursor.execute(sql, values)
             conn.commit()
+            return cursor.lastrowid
     except MySQLError as e:
         if e.args[0] in (1406, 1264):
             log_error(conn, dev_id, ts, f"Insert failed: {e} - field values: {data_fields}")
             logger.warning(f"Logged data error for device {dev_id}")
+            return None
         else:
             logger.error(f"Insert error: {e}")
             raise
 
-# ---------- Connection tracking functions (unchanged) ----------
+# ---------- Connection tracking functions ----------
 def close_device_connection(conn, dev_name):
     """Mark the current open connection as disconnected"""
     try:
@@ -198,76 +231,17 @@ def on_connect(client, userdata, flags, rc, properties=None):
 def on_disconnect(client, userdata, rc, properties=None, reason_code=None):
     logger.warning(f"Disconnected (rc={rc}, reason={reason_code})")
 
-def on_message(client, userdata, msg):
-    topic = msg.topic
-    payload = msg.payload.decode('utf-8').strip()
-
-    # Handle $SYS/broker/log/N messages for connection tracking
-    if topic == "$SYS/broker/log/N":
-        logger.debug(f"SYS log: {payload}")
-        conn_match = re.search(r'as (\S+) \(', payload)
-        if conn_match:
-            client_id = conn_match.group(1)
-            logger.info(f"Device '{client_id}' connected")
-            try:
-                db = get_db_connection()
-                create_device_connection(db, client_id)
-            except Exception as e:
-                logger.error(f"Failed to process connect event: {e}")
-            return
-        disconn_match = re.search(r'Client (\S+) disconnected\.', payload)
-        if disconn_match:
-            client_id = disconn_match.group(1)
-            logger.info(f"Device '{client_id}' disconnected")
-            try:
-                db = get_db_connection()
-                close_device_connection(db, client_id)
-            except Exception as e:
-                logger.error(f"Failed to process disconnect event: {e}")
-            return
-        return
-
-    # Handle normal data/diagnostic messages
-    try:
-        data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return
-
-    if topic.startswith("IOT_DB/DAT"):
-        msg_type = "DAT"
-    elif topic.startswith("IOT_DB/DIAG"):
-        msg_type = "DIAG"
-    else:
-        return
-
-    dev_name = data.get('dNM')
-    if not dev_name:
-        logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
-        return
-
-    db = None
-    try:
-        db = get_db_connection()
-        if msg_type == "DAT":
-            process_data(db, data, topic, dev_name)
-        else:
-            process_diagnostics(db, data, topic, dev_name)
-    except Exception as e:
-        logger.error(f"Device: {dev_name} – {str(e)}")
-
-# ---------- Data and diagnostic processing with dynamic prefix filtering ----------
-def process_diagnostics(conn, data, topic, dev_name):
-    diag_type = data.get('dDGT')
-    if not diag_type:
-        logger.warning(f"Missing dDGT in DIAG message from {topic} (device {dev_name}) – ignoring")
-        return
-
+def process_diagnostic_entry(conn, data_dict, dev_name, table_name, parent_id=None):
+    """Save a single diagnostic dictionary into the specified table.
+       If parent_id is None, creates a parent table (without parent_id column).
+       Otherwise ensures a child table with the parent_id column."""
+    # Get device ID
     with conn.cursor() as cursor:
         cursor.execute("CALL GetDeviceID(%s, @devID)", (dev_name,))
         cursor.execute("SELECT @devID")
         dev_id = cursor.fetchone()[0]
         conn.commit()
-        logger.debug(f"Device {dev_name} -> devID {dev_id} (diagnostic only)")
+        logger.debug(f"Device {dev_name} -> devID {dev_id}")
 
     # Update last_msg_ts of active connection
     try:
@@ -280,13 +254,17 @@ def process_diagnostics(conn, data, topic, dev_name):
     except Exception as e:
         logger.debug(f"Could not update last_msg_ts: {e}")
 
-    table_name = sanitize_name(diag_type, "dia")
-    ensure_data_table(conn, table_name)
+    # Ensure table exists (child vs parent)
+    if parent_id is not None:
+        ensure_child_table(conn, table_name)
+    else:
+        ensure_data_table(conn, table_name)
 
-    # Extract dynamic fields with prefix filtering
+    # Extract dynamic fields (only those with configured prefixes)
     dynamic_fields = {}
-    for key, value in data.items():
-        if key in RESERVED_KEYS_DIAG:
+    for key, value in data_dict.items():
+        # Skip reserved keys and the dS flag (if present)
+        if key in RESERVED_KEYS_DIAG or key == 'dS':
             continue
         matched_prefix = None
         for prefix in DYNAMIC_FIELD_PREFIXES:
@@ -304,10 +282,12 @@ def process_diagnostics(conn, data, topic, dev_name):
         add_column_if_not_exists(conn, table_name, col_name, sql_type)
 
     now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    insert_data_row(conn, table_name, dev_id, now_ts, dynamic_fields)
-    logger.debug(f"Diagnostic data for {dev_name} saved into {table_name}")
+    row_id = insert_data_row(conn, table_name, dev_id, now_ts, dynamic_fields, parent_id)
+    logger.debug(f"Data saved into {table_name} (parent_id={parent_id}), id={row_id}")
+    return row_id
 
-def process_data(conn, data, topic, dev_name):
+def process_data_message(conn, data, topic, dev_name):
+    """Original data message handling (IOT_DB/DAT/#)"""
     save_flag = data.get('dS')
     if save_flag not in ('S', 's', 'Y', 'y', '1'):
         logger.debug(f"Ignoring DAT message: dS={save_flag}")
@@ -343,7 +323,6 @@ def process_data(conn, data, topic, dev_name):
         table_name = sanitize_name(proj_id, "dt")
         ensure_data_table(conn, table_name)
 
-        # Extract dynamic fields with prefix filtering
         dynamic_fields = {}
         for key, value in data.items():
             if key in RESERVED_KEYS_DAT:
@@ -367,6 +346,88 @@ def process_data(conn, data, topic, dev_name):
         logger.debug(f"Data for {dev_name} saved into {table_name}")
     else:
         logger.info(f"No project ID for {dev_name} – data discarded (device record updated)")
+
+def on_message(client, userdata, msg):
+    topic = msg.topic
+    payload = msg.payload.decode('utf-8').strip()
+
+    # Handle connection tracking via $SYS/broker/log/N
+    if topic == "$SYS/broker/log/N":
+        logger.debug(f"SYS log: {payload}")
+        conn_match = re.search(r'as (\S+) \(', payload)
+        if conn_match:
+            client_id = conn_match.group(1)
+            logger.info(f"Device '{client_id}' connected")
+            try:
+                db = get_db_connection()
+                create_device_connection(db, client_id)
+            except Exception as e:
+                logger.error(f"Failed to process connect event: {e}")
+            return
+        disconn_match = re.search(r'Client (\S+) disconnected\.', payload)
+        if disconn_match:
+            client_id = disconn_match.group(1)
+            logger.info(f"Device '{client_id}' disconnected")
+            try:
+                db = get_db_connection()
+                close_device_connection(db, client_id)
+            except Exception as e:
+                logger.error(f"Failed to process disconnect event: {e}")
+            return
+        return
+
+    # Normal data/diagnostic messages
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+
+    if topic.startswith("IOT_DB/DAT"):
+        msg_type = "DAT"
+    elif topic.startswith("IOT_DB/DIAG"):
+        msg_type = "DIAG"
+    else:
+        return
+
+    dev_name = data.get('dNM')
+    if not dev_name:
+        logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
+        return
+
+    db = None
+    try:
+        db = get_db_connection()
+        if msg_type == "DAT":
+            process_data_message(db, data, topic, dev_name)
+        else:  # DIAG
+            # Root diagnostic: always saved (dS not required)
+            root_diag_type = data.get('dDGT')
+            if not root_diag_type:
+                logger.warning(f"Missing dDGT in DIAG message from {topic} – ignoring entire message")
+            else:
+                root_table = sanitize_name(root_diag_type, "dia")
+                root_id = process_diagnostic_entry(db, data, dev_name, root_table, parent_id=None)
+                logger.debug(f"Root diagnostic saved with id={root_id}")
+
+                # Process additional diagnostics inside the array
+                diag_list = data.get(DIAG_ARRAY_FIELD)
+                if isinstance(diag_list, list) and root_id:
+                    for idx, entry in enumerate(diag_list):
+                        if not isinstance(entry, dict):
+                            logger.warning(f"Diagnostic entry {idx} is not a dict, skipping")
+                            continue
+                        child_diag = entry.get('dDGT')
+                        child_save = entry.get('dS')
+                        if not child_diag:
+                            logger.warning(f"Diagnostic entry {idx} missing dDGT, skipping")
+                            continue
+                        if child_save not in ('S', 's', 'Y', 'y', '1'):
+                            logger.debug(f"Skipping diagnostic entry {idx} (dS={child_save})")
+                            continue
+                        child_table = sanitize_name(f"{root_diag_type}_{child_diag}", "dia")
+                        process_diagnostic_entry(db, entry, dev_name, child_table, parent_id=root_id)
+    except Exception as e:
+        logger.error(f"Device: {dev_name} – {str(e)}")
 
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
