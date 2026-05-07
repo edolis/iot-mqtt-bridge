@@ -29,6 +29,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 RESERVED_KEYS_DAT = {"dNM", "dPJ", "dS"}
 RESERVED_KEYS_DIAG = {"dNM", "dDGT"}
 
+# Dynamic field prefixes – only keys starting with these are stored (prefix stripped)
+DYNAMIC_FIELD_PREFIXES = ["d_"]   # you can add more, e.g., "s_", "v_"
+
 # Session timeout (minutes) – only used as fallback if disconnect not seen
 SESSION_TIMEOUT_MINUTES = 30
 
@@ -40,7 +43,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper()),
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- Helper functions (unchanged) ----------
+# ---------- Helper functions (unchanged except get_sql_type remains) ----------
 def sanitize_name(raw, prefix):
     clean = re.sub(r'[^A-Za-z0-9_]', '', raw)
     if not clean:
@@ -126,7 +129,7 @@ def insert_data_row(conn, table_name, dev_id, ts, data_fields):
             logger.error(f"Insert error: {e}")
             raise
 
-# ---------- Connection tracking functions (added) ----------
+# ---------- Connection tracking functions (unchanged) ----------
 def close_device_connection(conn, dev_name):
     """Mark the current open connection as disconnected"""
     try:
@@ -187,7 +190,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info(f"Connected to MQTT broker, subscribing to {MQTT_TOPIC}")
         client.subscribe(MQTT_TOPIC)
-        # Also subscribe to $SYS/broker/log/N for connection events
         client.subscribe("$SYS/broker/log/N")
         logger.info("Subscribed to $SYS/broker/log/N for connection tracking")
     else:
@@ -203,7 +205,6 @@ def on_message(client, userdata, msg):
     # Handle $SYS/broker/log/N messages for connection tracking
     if topic == "$SYS/broker/log/N":
         logger.debug(f"SYS log: {payload}")
-        # Parse connection: "... as ESP_32:97:54 (p5,..."
         conn_match = re.search(r'as (\S+) \(', payload)
         if conn_match:
             client_id = conn_match.group(1)
@@ -214,7 +215,6 @@ def on_message(client, userdata, msg):
             except Exception as e:
                 logger.error(f"Failed to process connect event: {e}")
             return
-        # Parse disconnection: "Client ESP_32:97:54 disconnected."
         disconn_match = re.search(r'Client (\S+) disconnected\.', payload)
         if disconn_match:
             client_id = disconn_match.group(1)
@@ -225,17 +225,14 @@ def on_message(client, userdata, msg):
             except Exception as e:
                 logger.error(f"Failed to process disconnect event: {e}")
             return
-        # Not a connection/disconnection line – ignore
         return
 
-    # Otherwise, handle normal data/diagnostic messages (original logic)
+    # Handle normal data/diagnostic messages
     try:
         data = json.loads(payload)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        # Silently ignore invalid JSON
         return
 
-    # Determine if it's DAT or DIAG
     if topic.startswith("IOT_DB/DAT"):
         msg_type = "DAT"
     elif topic.startswith("IOT_DB/DIAG"):
@@ -258,7 +255,7 @@ def on_message(client, userdata, msg):
     except Exception as e:
         logger.error(f"Device: {dev_name} – {str(e)}")
 
-# ---------- Data and diagnostic processing (unchanged except removed old connection timeout logic) ----------
+# ---------- Data and diagnostic processing with dynamic prefix filtering ----------
 def process_diagnostics(conn, data, topic, dev_name):
     diag_type = data.get('dDGT')
     if not diag_type:
@@ -272,10 +269,7 @@ def process_diagnostics(conn, data, topic, dev_name):
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id} (diagnostic only)")
 
-    # Note: connection tracking is now done via $SYS log, not here
-    # The `last_msg_ts` of the active connection will be updated separately by the $SYS connect/disconnect logic.
-    # However, to keep `last_msg_ts` accurate (updating on every message), we can add that here.
-    # Let's add a small update to touch the last_msg_ts of the active connection.
+    # Update last_msg_ts of active connection
     try:
         with conn.cursor() as cursor2:
             cursor2.execute("""
@@ -289,11 +283,20 @@ def process_diagnostics(conn, data, topic, dev_name):
     table_name = sanitize_name(diag_type, "dia")
     ensure_data_table(conn, table_name)
 
+    # Extract dynamic fields with prefix filtering
     dynamic_fields = {}
     for key, value in data.items():
         if key in RESERVED_KEYS_DIAG:
             continue
-        col_name = "d_" + re.sub(r'[^A-Za-z0-9_]', '_', key)
+        matched_prefix = None
+        for prefix in DYNAMIC_FIELD_PREFIXES:
+            if key.startswith(prefix):
+                matched_prefix = prefix
+                break
+        if not matched_prefix:
+            continue
+        base_name = key[len(matched_prefix):]
+        col_name = re.sub(r'[^A-Za-z0-9_]', '_', base_name)
         dynamic_fields[col_name] = value
 
     for col_name, value in dynamic_fields.items():
@@ -325,7 +328,7 @@ def process_data(conn, data, topic, dev_name):
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id}")
 
-    # Update last_msg_ts of the active connection (if any)
+    # Update last_msg_ts of active connection
     try:
         with conn.cursor() as cursor2:
             cursor2.execute("""
@@ -340,11 +343,20 @@ def process_data(conn, data, topic, dev_name):
         table_name = sanitize_name(proj_id, "dt")
         ensure_data_table(conn, table_name)
 
+        # Extract dynamic fields with prefix filtering
         dynamic_fields = {}
         for key, value in data.items():
             if key in RESERVED_KEYS_DAT:
                 continue
-            col_name = "d_" + re.sub(r'[^A-Za-z0-9_]', '_', key)
+            matched_prefix = None
+            for prefix in DYNAMIC_FIELD_PREFIXES:
+                if key.startswith(prefix):
+                    matched_prefix = prefix
+                    break
+            if not matched_prefix:
+                continue
+            base_name = key[len(matched_prefix):]
+            col_name = re.sub(r'[^A-Za-z0-9_]', '_', base_name)
             dynamic_fields[col_name] = value
 
         for col_name, value in dynamic_fields.items():
@@ -356,7 +368,6 @@ def process_data(conn, data, topic, dev_name):
     else:
         logger.info(f"No project ID for {dev_name} – data discarded (device record updated)")
 
-# ---------- Main ----------
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
     global db_conn

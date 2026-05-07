@@ -48,6 +48,17 @@ Any additional key‑value pairs are stored as dynamic columns prefixed with `d_
   "humidity": 60
 }
 ```
+## Dynamic Field Prefixes
+
+The bridge only stores JSON keys that start with one of the prefixes defined in `DYNAMIC_FIELD_PREFIXES`. The prefix is stripped, and the remaining part becomes the column name.
+
+Default: `DYNAMIC_FIELD_PREFIXES = ["d_"]`
+
+Example:
+- JSON: `{"d_temperature": 23.5}` → column: `temperature`
+- JSON: `{"temperature": 23.5}` → ignored (no prefix)
+
+You can add multiple prefixes, e.g., `["d_", "s_"]`. To change, edit the script and restart the service.
 
 ### Diagnostic Messages (`IOT_DB/DIAG/#`)
 
@@ -80,13 +91,13 @@ All settings are read from environment variables. Create a file `/etc/mqtt2db/en
 ```env
 MQTT_BROKER=raspi00
 MQTT_PORT=8883
-MQTT_USER=edolis
+MQTT_USER=usr
 MQTT_PASS=your_mqtt_password
 MQTT_TLS_ENABLED=true
 MQTT_TLS_CA_CERTS=/etc/mosquitto/certs/ca.crt
 DB_HOST=localhost
-DB_USER=pyBridge
-DB_PASS=pyBridgeSpring
+DB_USER=usrBr
+DB_PASS=password
 DB_NAME=IOT_DB
 LOG_LEVEL=INFO
 ```
