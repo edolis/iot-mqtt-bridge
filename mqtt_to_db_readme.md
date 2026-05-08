@@ -1,14 +1,33 @@
-# MQTT to MariaDB Bridge – Integrated Connection Tracking
+# MQTT to MariaDB Bridge – MQTT 5.0 Client Identification
 
 ## Overview
 
 This service subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
-It also **tracks device connection sessions in real time** by subscribing to Mosquitto’s `$SYS/broker/log/N` topic. When a client connects or disconnects, the `DEVICE_CONN` table is updated immediately.
+It uses **MQTT 5.0 User Properties** to reliably identify the sending client (the ESP32) via a `client-id` property. This guarantees that even malformed JSON payloads can be attributed to the correct device, and all errors logged in `E_LOG` have a valid `devID`.
 
 Two message types are supported:
 
 - **Data messages** (`IOT_DB/DAT/...`) – require `dNM`, `dPJ`, `dS` fields. Saved into project‑specific tables `dt_<projectID>`.
 - **Diagnostic messages** (`IOT_DB/DIAG/...`) – store diagnostic information. A root diagnostic block is **always saved**; additional blocks inside a `diagnostics` array can be saved conditionally.
+
+The service also subscribes to `$SYS/broker/log/N` for real‑time client connection/disconnection events.
+
+---
+
+## MQTT 5.0 Client Identification
+
+Each message published by an ESP32 must include a User Property with key `"client-id"` and value equal to the device’s name (e.g., `"ESP_32:97:54"`). The bridge reads this property from every incoming message and uses it to:
+
+- Identify the device when the JSON payload is malformed (so that `devID` can still be logged).
+- Fallback when the JSON field `dNM` is missing.
+
+On the ESP32 (using ESP‑IDF MQTT 5.0 client), the code to add the property is:
+
+```c
+esp_mqtt5_user_property_handle_t user_property = NULL;
+esp_mqtt5_client_set_user_property(NULL, &user_property, "client-id", client_id);
+esp_mqtt_client_publish(client, topic, payload, 0, qos, retain, user_property);
+```
 
 ---
 
@@ -31,7 +50,7 @@ The service also subscribes to `$SYS/broker/log/N` for real‑time client connec
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name (unique identifier) | `"ESP_41:2F:6C"` |
+| `dNM` | Device name (may be omitted, bridge uses client‑id instead) | `"ESP_41:2F:6C"` |
 | `dPJ` | Project ID – if empty, **no sensor data is saved** | `"P001"` |
 | `dS`  | Save flag (must be `S`, `s`, `Y`, `y`, `1`) | `"S"` |
 
@@ -61,7 +80,7 @@ Diagnostic messages can contain a **root block** (always saved) and **additional
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name | `"ESP_32:97:54"` |
+| `dNM` | Device name (optional – client‑id is used as fallback) | `"ESP_32:97:54"` |
 | `dDGT` | Diagnostic type – table name `dia_<type>` | `"DTF"` |
 | (other fields) | Any keys with the configured prefix become dynamic columns | `d_UPT: "0d11h59m"` |
 
@@ -103,32 +122,6 @@ Each entry in the array is a JSON object containing:
 - The root block is always saved: a new row is inserted into `dia_DTF` with the dynamic fields `UPS`, `UPT`, `rssi_dbm`, `rssi_ID`.
 - The additional block is saved **only if** `dS` is `"S"`. A new row is inserted into `dia_DTF_DTM` with a `parent_id` column that stores the `id` of the root row.
 
-#### Example: Multiple additional diagnostics (some may be skipped)
-
-```json
-{
-  "dNM": "ESP_32:97:54",
-  "dDGT": "DTF",
-  "d_UPS": 43168,
-  "diagnostics": [
-    {
-      "dDGT": "DTM",
-      "dS": "S",
-      "d_hfree": 219240,
-      "note": "This field has no d_ prefix and will be ignored"
-    },
-    {
-      "dDGT": "TMP",
-      "dS": "N",
-      "d_temp": 25.5
-    }
-  ]
-}
-```
-
-- The first entry (`DTM`) is saved because `dS` is `"S"`.
-- The second entry (`TMP`) is **not saved** because `dS` is not a valid save flag.
-
 ---
 
 ## Database Schema
@@ -166,13 +159,44 @@ CREATE TABLE dia_DTF_DTM (
 
 - `parent_id` references the `id` in `dia_DTF`, linking child data to the parent message.
 
+### Error Log Table (`E_LOG`)
+
+The bridge logs two categories of errors:
+
+- **`M` (Message errors)** – JSON parsing failures (malformed payloads). These now always include a valid `devID` because the bridge extracts the client ID from the MQTT 5.0 User Property. The raw payload and MQTT topic are also stored. At most 200 rows are kept.
+- **`D` (Database errors)** – insertion failures, data too long, out of range, stored procedure errors. At most 1000 rows are kept.
+
+Table structure:
+
+```sql
+CREATE TABLE E_LOG (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    devID SMALLINT UNSIGNED NULL,
+    category CHAR(1) NOT NULL DEFAULT 'D',
+    topic VARCHAR(255) NULL,
+    payload TEXT NULL,
+    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    message TEXT NOT NULL,
+    PRIMARY KEY (id),
+    INDEX idx_category_ts (category, ts)
+);
+```
+
+To view recent message errors (JSON parse failures):
+
+```sql
+SELECT * FROM E_LOG WHERE category = 'M' ORDER BY ts DESC LIMIT 20;
+```
+
 ### Other Tables
 
 | Table | Purpose |
 |-------|---------|
 | `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
 | `DEVICE_CONN` | Connection sessions (tracked via `$SYS` logs) |
-| `E_LOG` | Error log |
+| `dt_<projectID>` | Dynamic tables for sensor data |
+| `dia_<type>` | Parent diagnostic tables |
+| `dia_<parent>_<child>` | Child diagnostic tables (with `parent_id`) |
 
 ### View `vw_CONN_LOG` for connection history
 
@@ -273,7 +297,7 @@ sudo systemctl restart mosquitto
 
 ```ini
 [Unit]
-Description=MQTT to MariaDB Data Saver with diagnostic parent‑child tables
+Description=MQTT to MariaDB Data Saver with client-id User Property
 After=network.target mariadb.service mosquitto.service
 
 [Service]
@@ -302,10 +326,10 @@ sudo systemctl start mqtt2db.service
 ## Logging
 
 - Service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
-- Errors also written to `E_LOG` table.
-- Connection events are logged at `INFO` level.
+- **JSON parsing errors** (malformed payloads) are logged to `E_LOG` with category `'M'`. Thanks to the MQTT 5.0 `client-id` property, `devID` is always populated. The raw payload and MQTT topic are stored. At most 200 rows are kept.
+- **Database errors** (insertion failures, truncation, etc.) are logged to `E_LOG` with category `'D'`, with a limit of 1000 rows.
 
-To view debug logs, set `LOG_LEVEL=DEBUG` in the environment.
+To view debug logs, set `LOG_LEVEL=DEBUG` in the environment and restart.
 
 ---
 
@@ -318,4 +342,9 @@ To view debug logs, set `LOG_LEVEL=DEBUG` in the environment.
 | Data not saved | `dS` missing/invalid? `dPJ` empty? Topic not under `IOT_DB/DAT/`? |
 | Diagnostic root not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
 | Child diagnostic not saved | Check `dS` in array entry. |
+| Malformed JSON errors logged | See `E_LOG` with `category = 'M'`; the client ID is always present. |
 | Connection table not updating | Ensure `log_dest topic` is set in Mosquitto and restarted. |
+
+---
+
+*Documentation version 7.0 – MQTT 5.0 User Property `client-id` for robust device identification.*

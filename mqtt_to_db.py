@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import paho.mqtt.client as mqtt
+from paho.mqtt.client import MQTTv5
 import pymysql
 from pymysql import Error as MySQLError
 import re
@@ -38,6 +39,10 @@ DIAG_ARRAY_FIELD = "diagnostics"
 # Session timeout (minutes) – only used as fallback if disconnect not seen
 SESSION_TIMEOUT_MINUTES = 30
 
+# Retention limits for E_LOG categories
+MAX_MESSAGE_LOGS = 200   # keep at most 200 JSON/parsing errors
+MAX_DB_LOGS = 1000       # keep at most 1000 database errors
+
 # Global database connection and column cache
 db_conn = None
 column_cache = set()
@@ -58,7 +63,7 @@ def get_sql_type(value):
     if isinstance(value, bool):
         return "TINYINT(1)"
     elif isinstance(value, int):
-        return "INT"               # was BIGINT – changed to INT for space efficiency
+        return "INT"
     elif isinstance(value, float):
         return "DECIMAL(20,10)"
     elif isinstance(value, str):
@@ -88,7 +93,7 @@ def add_column_if_not_exists(conn, table_name, column_name, sql_type):
         raise
 
 def ensure_data_table(conn, table_name):
-    """Create parent diagnostic table (without parent_id)"""
+    """Create parent diagnostic or data table (without parent_id)"""
     try:
         with conn.cursor() as cursor:
             cursor.execute(f"""
@@ -126,16 +131,40 @@ def ensure_child_table(conn, table_name):
         logger.error(f"Failed to create child table {table_name}: {e}")
         raise
 
-def log_error(conn, dev_id, ts, message):
+def log_unified_error(conn, dev_id, ts, message, category='D', topic=None, payload=None):
+    """
+    Insert an error into E_LOG with category and optional topic/payload.
+    After insertion, prune old rows for the same category.
+    """
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO E_LOG (devID, ts, message) VALUES (%s, %s, %s)",
-                (dev_id, ts, message[:1000])
-            )
+            cursor.execute("""
+                INSERT INTO E_LOG (devID, category, topic, payload, ts, message)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (dev_id, category, topic, payload, ts, message[:1000]))
             conn.commit()
-    except MySQLError as e:
-        logger.error(f"Failed to log error: {e}")
+
+            limit = MAX_MESSAGE_LOGS if category == 'M' else MAX_DB_LOGS
+            cursor.execute("SELECT COUNT(*) FROM E_LOG WHERE category = %s", (category,))
+            count = cursor.fetchone()[0]
+            if count > limit:
+                delete_count = count - limit
+                cursor.execute("""
+                    DELETE FROM E_LOG
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id FROM E_LOG
+                            WHERE category = %s
+                            ORDER BY ts ASC
+                            LIMIT %s
+                        ) AS t
+                    )
+                """, (category, delete_count))
+                conn.commit()
+                logger.debug(f"Pruned {delete_count} old rows from category {category}")
+    except Exception as e:
+        logger.error(f"Failed to log unified error: {e}")
+        conn.rollback()
 
 def insert_data_row(conn, table_name, dev_id, ts, data_fields, parent_id=None):
     columns = ['deviceID', 'ts']
@@ -155,16 +184,15 @@ def insert_data_row(conn, table_name, dev_id, ts, data_fields, parent_id=None):
             return cursor.lastrowid
     except MySQLError as e:
         if e.args[0] in (1406, 1264):
-            log_error(conn, dev_id, ts, f"Insert failed: {e} - field values: {data_fields}")
+            log_unified_error(conn, dev_id, ts, f"Insert failed: {e} - field values: {data_fields}", category='D')
             logger.warning(f"Logged data error for device {dev_id}")
             return None
         else:
             logger.error(f"Insert error: {e}")
             raise
 
-# ---------- Connection tracking functions ----------
+# ---------- Connection tracking functions (unchanged) ----------
 def close_device_connection(conn, dev_name):
-    """Mark the current open connection as disconnected"""
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT devID FROM DEVICES WHERE devName = %s", (dev_name,))
@@ -186,7 +214,6 @@ def close_device_connection(conn, dev_name):
         conn.rollback()
 
 def create_device_connection(conn, dev_name):
-    """Create a new connection record for a device, storing current projID"""
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT devID, devPROJID FROM DEVICES WHERE devName = %s", (dev_name,))
@@ -213,10 +240,38 @@ def get_db_connection():
                                       password=DB_PASSWORD, database=DB_NAME,
                                       autocommit=False, connect_timeout=5)
             logger.info("Database connected")
+            # Ensure E_LOG has extended columns
+            with db_conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'E_LOG' AND COLUMN_NAME = 'category'
+                """, (DB_NAME,))
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("ALTER TABLE E_LOG ADD COLUMN category CHAR(1) NOT NULL DEFAULT 'D'")
+                    cursor.execute("ALTER TABLE E_LOG ADD COLUMN topic VARCHAR(255) NULL")
+                    cursor.execute("ALTER TABLE E_LOG ADD COLUMN payload TEXT NULL")
+                    cursor.execute("CREATE INDEX idx_category_ts ON E_LOG (category, ts)")
+                    db_conn.commit()
+                    logger.info("Extended E_LOG table with category, topic, payload columns")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise
     return db_conn
+
+# ---------- Helper to get/create device from client ID (MQTT5 User Property) ----------
+def get_devid_from_clientid(conn, client_id):
+    """Call the GetDeviceID stored procedure to get (or create) a device and return its devID."""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("CALL GetDeviceID(%s, @devID)", (client_id,))
+            cursor.execute("SELECT @devID")
+            dev_id = cursor.fetchone()[0]
+            conn.commit()
+            return dev_id
+    except Exception as e:
+        logger.error(f"Failed to get/create device for client ID '{client_id}': {e}")
+        conn.rollback()
+        return None
 
 # ---------- MQTT callbacks ----------
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -232,10 +287,7 @@ def on_disconnect(client, userdata, rc, properties=None, reason_code=None):
     logger.warning(f"Disconnected (rc={rc}, reason={reason_code})")
 
 def process_diagnostic_entry(conn, data_dict, dev_name, table_name, parent_id=None):
-    """Save a single diagnostic dictionary into the specified table.
-       If parent_id is None, creates a parent table (without parent_id column).
-       Otherwise ensures a child table with the parent_id column."""
-    # Get device ID
+    """Save a single diagnostic dictionary into the specified table."""
     with conn.cursor() as cursor:
         cursor.execute("CALL GetDeviceID(%s, @devID)", (dev_name,))
         cursor.execute("SELECT @devID")
@@ -243,7 +295,6 @@ def process_diagnostic_entry(conn, data_dict, dev_name, table_name, parent_id=No
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id}")
 
-    # Update last_msg_ts of active connection
     try:
         with conn.cursor() as cursor2:
             cursor2.execute("""
@@ -254,16 +305,13 @@ def process_diagnostic_entry(conn, data_dict, dev_name, table_name, parent_id=No
     except Exception as e:
         logger.debug(f"Could not update last_msg_ts: {e}")
 
-    # Ensure table exists (child vs parent)
     if parent_id is not None:
         ensure_child_table(conn, table_name)
     else:
         ensure_data_table(conn, table_name)
 
-    # Extract dynamic fields (only those with configured prefixes)
     dynamic_fields = {}
     for key, value in data_dict.items():
-        # Skip reserved keys and the dS flag (if present)
         if key in RESERVED_KEYS_DIAG or key == 'dS':
             continue
         matched_prefix = None
@@ -287,7 +335,6 @@ def process_diagnostic_entry(conn, data_dict, dev_name, table_name, parent_id=No
     return row_id
 
 def process_data_message(conn, data, topic, dev_name):
-    """Original data message handling (IOT_DB/DAT/#)"""
     save_flag = data.get('dS')
     if save_flag not in ('S', 's', 'Y', 'y', '1'):
         logger.debug(f"Ignoring DAT message: dS={save_flag}")
@@ -308,7 +355,6 @@ def process_data_message(conn, data, topic, dev_name):
         conn.commit()
         logger.debug(f"Device {dev_name} -> devID {dev_id}")
 
-    # Update last_msg_ts of active connection
     try:
         with conn.cursor() as cursor2:
             cursor2.execute("""
@@ -351,7 +397,7 @@ def on_message(client, userdata, msg):
     topic = msg.topic
     payload = msg.payload.decode('utf-8').strip()
 
-    # Handle connection tracking via $SYS/broker/log/N
+    # Handle $SYS/broker/log/N for connection tracking
     if topic == "$SYS/broker/log/N":
         logger.debug(f"SYS log: {payload}")
         conn_match = re.search(r'as (\S+) \(', payload)
@@ -376,12 +422,31 @@ def on_message(client, userdata, msg):
             return
         return
 
-    # Normal data/diagnostic messages
+    # --- Extract MQTT 5.0 User Property "client-id" ---
+    publisher_client_id = None
+    if hasattr(msg, 'properties') and msg.properties:
+        for key, value in msg.properties.UserProperty:
+            if key == "client-id":
+                publisher_client_id = value
+                break
+
+    # --- Attempt to parse JSON ---
     try:
         data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Malformed JSON: use the publisher's client ID (from User Property) to identify the device
+        conn = get_db_connection()
+        dev_id = None
+        if publisher_client_id:
+            dev_id = get_devid_from_clientid(conn, publisher_client_id)
+            if dev_id:
+                logger.warning(f"Malformed JSON from device '{publisher_client_id}' (devID={dev_id}): {e}")
+        now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_unified_error(conn, dev_id, now_ts, str(e),
+                          category='M', topic=topic, payload=payload[:65535])
         return
 
+    # --- Valid JSON: determine message type ---
     if topic.startswith("IOT_DB/DAT"):
         msg_type = "DAT"
     elif topic.startswith("IOT_DB/DIAG"):
@@ -389,10 +454,15 @@ def on_message(client, userdata, msg):
     else:
         return
 
+    # Get device name from JSON (fallback to MQTT client ID if missing)
     dev_name = data.get('dNM')
     if not dev_name:
-        logger.warning(f"Missing dNM in {msg_type} message from {topic} – ignoring")
-        return
+        if publisher_client_id:
+            logger.warning(f"Missing dNM in {msg_type} message, using MQTT client ID '{publisher_client_id}'")
+            dev_name = publisher_client_id
+        else:
+            logger.warning(f"Missing dNM in {msg_type} message and no MQTT client ID – ignoring")
+            return
 
     db = None
     try:
@@ -400,7 +470,6 @@ def on_message(client, userdata, msg):
         if msg_type == "DAT":
             process_data_message(db, data, topic, dev_name)
         else:  # DIAG
-            # Root diagnostic: always saved (dS not required)
             root_diag_type = data.get('dDGT')
             if not root_diag_type:
                 logger.warning(f"Missing dDGT in DIAG message from {topic} – ignoring entire message")
@@ -409,7 +478,6 @@ def on_message(client, userdata, msg):
                 root_id = process_diagnostic_entry(db, data, dev_name, root_table, parent_id=None)
                 logger.debug(f"Root diagnostic saved with id={root_id}")
 
-                # Process additional diagnostics inside the array
                 diag_list = data.get(DIAG_ARRAY_FIELD)
                 if isinstance(diag_list, list) and root_id:
                     for idx, entry in enumerate(diag_list):
@@ -428,6 +496,18 @@ def on_message(client, userdata, msg):
                         process_diagnostic_entry(db, entry, dev_name, child_table, parent_id=root_id)
     except Exception as e:
         logger.error(f"Device: {dev_name} – {str(e)}")
+        if db:
+            try:
+                dev_id = None
+                with db.cursor() as cur:
+                    cur.execute("SELECT devID FROM DEVICES WHERE devName = %s", (dev_name,))
+                    row = cur.fetchone()
+                    if row:
+                        dev_id = row[0]
+                now_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                log_unified_error(db, dev_id, now_ts, f"Processing error in {msg_type}: {str(e)[:500]}", category='D')
+            except Exception as log_err:
+                logger.error(f"Failed to log processing error: {log_err}")
 
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
@@ -441,7 +521,8 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    # Use MQTT 5.0 protocol to receive User Properties
+    client = mqtt.Client(protocol=MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
