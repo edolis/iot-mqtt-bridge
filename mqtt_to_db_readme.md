@@ -1,27 +1,23 @@
-# MQTT to MariaDB Bridge – MQTT 5.0 Client Identification
+# MQTT to MariaDB Bridge – MQTT 5.0, LWT & Firmware Tracking
 
 ## Overview
 
-This service subscribes to MQTT topics under `IOT_DB/#` and stores JSON messages from ESP32 devices into a MariaDB database.
-It uses **MQTT 5.0 User Properties** to reliably identify the sending client (the ESP32) via a `client-id` property. This guarantees that even malformed JSON payloads can be attributed to the correct device, and all errors logged in `E_LOG` have a valid `devID`.
+This service subscribes to MQTT topics and stores JSON messages from ESP32 devices into a MariaDB database.
+It uses **MQTT 5.0 User Properties** (`client-id`) as the primary device identifier and **Last Will & Testament (LWT)** messages to track connection state.
 
-Two message types are supported:
+The bridge handles three categories of messages:
 
-- **Data messages** (`IOT_DB/DAT/...`) – require `dNM`, `dPJ`, `dS` fields. Saved into project‑specific tables `dt_<projectID>`.
-- **Diagnostic messages** (`IOT_DB/DIAG/...`) – store diagnostic information. A root diagnostic block is **always saved**; additional blocks inside a `diagnostics` array can be saved conditionally.
-
-The service also subscribes to `$SYS/broker/log/N` for real‑time client connection/disconnection events.
+- **Data messages** – store sensor readings into project‑specific tables (`dt_<projectID>`).
+- **Diagnostic messages** – store system health metrics into parent‑child tables (`dia_<type>`, `dia_<parent>_<child>`).
+- **Status messages** – report device online/offline state and firmware information (updates `DEVICES` table).
 
 ---
 
 ## MQTT 5.0 Client Identification
 
-Each message published by an ESP32 must include a User Property with key `"client-id"` and value equal to the device’s name (e.g., `"ESP_32:97:54"`). The bridge reads this property from every incoming message and uses it to:
+Every published message **must** include an MQTT 5.0 User Property with key `"client-id"` and value equal to the device name (e.g., `"ESP_32:97:54"`). The bridge reads this property first; it is the most reliable source of the device identity. Fallbacks (topic, JSON field `dNM`) are used only if the property is missing.
 
-- Identify the device when the JSON payload is malformed (so that `devID` can still be logged).
-- Fallback when the JSON field `dNM` is missing.
-
-On the ESP32 (using ESP‑IDF MQTT 5.0 client), the code to add the property is:
+ESP32 example (ESP‑IDF MQTT 5.0):
 
 ```c
 esp_mqtt5_user_property_handle_t user_property = NULL;
@@ -31,36 +27,77 @@ esp_mqtt_client_publish(client, topic, payload, 0, qos, retain, user_property);
 
 ---
 
-## MQTT Topics
+## MQTT Topics (New Hierarchy)
 
-| Topic pattern          | Purpose                                                   | Required fields                     |
-|-----------------------|-----------------------------------------------------------|-------------------------------------|
-| `IOT_DB/DAT/#`        | Sensor data (e.g., temperature, humidity)                 | `dNM`, `dPJ`, `dS`                  |
-| `IOT_DB/DIAG/#`       | Diagnostic data (e.g., system health, memory stats)       | `dNM`, `dDGT` (root block)          |
+| Topic pattern                          | Purpose                                   | Identifier source             |
+|----------------------------------------|-------------------------------------------|-------------------------------|
+| `devices/<client-id>/status`           | LWT and firmware information              | MQTT5 property (`client-id`)  |
+| `devices/<client-id>/data`             | Sensor data (project‑specific)            | MQTT5 property or topic       |
+| `devices/<client-id>/diag`             | Diagnostic data (health metrics)          | MQTT5 property or topic       |
 
-The service also subscribes to `$SYS/broker/log/N` for real‑time client connection/disconnection events.
+**Legacy topics** (still supported for backward compatibility):
+
+- `IOT_DB/DAT/#`
+- `IOT_DB/DIAG/#`
 
 ---
 
-## JSON Message Formats
+## Message Formats
 
-### Data Messages (`IOT_DB/DAT/#`)
+### 1. Status Message (online / offline + firmware)
 
+**Topic:** `devices/<client-id>/status`
+**Payload:** JSON object with `"status"` and optional `"fw"` object.
+
+**Example (online with firmware):**
+
+```json
+{
+  "status": "online",
+  "fw": {
+    "version": "v1.2.3",
+    "tag": "release-1.2.3",
+    "major": 1,
+    "minor": 2,
+    "patch": 3,
+    "build": 42,
+    "hash_short": "a1b2c3d",
+    "hash_full": "a1b2c3d4e5f67890...",
+    "build_id": "P20260513-123456",
+    "dirty": false,
+    "project": "IOT_BRIDGE"
+  }
+}
+```
+
+**Example (offline):**
+
+```json
+{"status": "offline"}
+```
+
+**Behaviour:**
+- `online` → closes any previous open connection, creates a new `DEVICE_CONN` row, updates `DEVICES` with firmware info (if provided).
+- `offline` → sets `disconnected_ts = NOW()` for the current open connection.
+
+---
+
+### 2. Data Message (sensor readings)
+
+**Topic:** `devices/<client-id>/data` (or `IOT_DB/DAT/#`)
 **Required fields:**
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name (may be omitted, bridge uses client‑id instead) | `"ESP_41:2F:6C"` |
-| `dPJ` | Project ID – if empty, **no sensor data is saved** | `"P001"` |
+| `dPJ` | Project ID – if empty, **no data saved** | `"P001"` |
 | `dS`  | Save flag (must be `S`, `s`, `Y`, `y`, `1`) | `"S"` |
 
-All other keys that start with a configured prefix (default `"d_"`) are stored as dynamic columns (prefix stripped). Other keys are ignored.
+All other keys that start with the configured prefix (default `"d_"`) are stored as dynamic columns (prefix stripped). Example: `d_temperature` → column `temperature`.
 
 **Example:**
 
 ```json
 {
-  "dNM": "ESP_ABC123",
   "dPJ": "P002",
   "dS": "S",
   "d_temperature": 23.5,
@@ -68,140 +105,116 @@ All other keys that start with a configured prefix (default `"d_"`) are stored a
 }
 ```
 
-This creates/inserts into `dt_P002` with columns `temperature` and `humidity`.
+→ Inserts into table `dt_P002` with columns `temperature`, `humidity`.
+→ Updates `last_msg_ts` in `DEVICE_CONN` for the device.
 
 ---
 
-### Diagnostic Messages (`IOT_DB/DIAG/#`)
+### 3. Diagnostic Message (health metrics)
 
-Diagnostic messages can contain a **root block** (always saved) and **additional blocks** inside a `diagnostics` array (saved only if they have `dS` set to a valid save flag).
+**Topic:** `devices/<client-id>/diag` (or `IOT_DB/DIAG/#`)
 
-#### Root block (always saved)
+Diagnostics use a **parent‑child** table structure. The parent table (`dia_<rootDGT>`) stores common fields (including device uptime). Child tables (`dia_<rootDGT>_<childDGT>`) store specific metrics, each with a `parent_id` linking to the parent row.
+
+**Saving logic:**
+
+- A parent row is created **if and only if**:
+  - The root block contains a valid `dS` flag, **OR**
+  - At least one entry in the `diagnostics` array has a valid `dS` flag.
+- **If parent is created and root `dS` is valid**: root‑level dynamic fields (e.g., `d_UPS`) are stored in the parent table.
+- **If parent is created but root `dS` is not valid**: parent row contains only `deviceID` and `ts` (no dynamic fields).
+- A child row is created **only if** that child entry has a valid `dS` flag. It is linked to the parent via `parent_id`.
+- The device’s uptime (`d_UPT`) is always stored in `DEVICE_CONN.uptime_str` for the current connection.
+
+#### Root block fields
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `dNM` | Device name (optional – client‑id is used as fallback) | `"ESP_32:97:54"` |
-| `dDGT` | Diagnostic type – table name `dia_<type>` | `"DTF"` |
-| (other fields) | Any keys with the configured prefix become dynamic columns | `d_UPT: "0d11h59m"` |
-
-**Note:** The root block does **not** require a `dS` field – it is always stored.
+| `dDGT` | Parent diagnostic type – table name `dia_<type>` | `"DTF"` |
+| `dS`  | **Save flag for root** – if valid, root dynamic fields are saved | `"S"` |
+| `d_UPT` | Device uptime string – stored in `DEVICE_CONN.uptime_str` | `"1 d 21:08:59"` |
+| other `d_` prefixed keys | Become dynamic columns in the parent table (only if `dS` valid) | `d_UPS: 43168` |
 
 #### Additional blocks (inside `diagnostics` array)
-
-Each entry in the array is a JSON object containing:
 
 | Field | Description | Example |
 |-------|-------------|---------|
 | `dDGT` | Child diagnostic type – table name `dia_<parent>_<child>` | `"DTM"` |
-| `dS`  | Save flag – if not set or invalid, the entry is skipped | `"S"` |
-| (other fields) | Dynamic fields (prefix stripped) become columns in the child table | `d_hfree: 219240` |
+| `dS`  | Save flag – if not set or invalid, child is skipped | `"S"` |
+| other `d_` prefixed keys | Become dynamic columns in the child table | `d_hfree: 219240` |
 
-#### Example: Single message with root + one additional diagnostic
+**Example: root `dS=Y`, child `dS=Y`**
 
 ```json
 {
-  "dNM": "ESP_32:97:54",
   "dDGT": "DTF",
+  "dS": "S",
+  "d_UPT": "1 d 21:08:59",
   "d_UPS": 43168,
-  "d_UPT": "0d11h59m",
-  "d_rssi_dbm": -70,
-  "d_rssi_ID": "Edolis",
   "diagnostics": [
     {
       "dDGT": "DTM",
       "dS": "S",
-      "d_hfree": 219240,
-      "d_hlarge": 172032
+      "d_hfree": 219240
     }
   ]
 }
 ```
 
-**What happens:**
+**Result:**
+- `DEVICE_CONN.uptime_str` updated to `"1 d 21:08:59"`.
+- Parent table `dia_DTF`: new row with columns `UPS`.
+- Child table `dia_DTF_DTM`: new row with column `hfree`, `parent_id` pointing to parent row.
 
-- The root block is always saved: a new row is inserted into `dia_DTF` with the dynamic fields `UPS`, `UPT`, `rssi_dbm`, `rssi_ID`.
-- The additional block is saved **only if** `dS` is `"S"`. A new row is inserted into `dia_DTF_DTM` with a `parent_id` column that stores the `id` of the root row.
+**Example: root `dS=N`, child `dS=Y`**
+
+```json
+{
+  "dDGT": "DTF",
+  "dS": "N",
+  "d_UPT": "2 d 03:15:22",
+  "diagnostics": [
+    {
+      "dDGT": "DTM",
+      "dS": "S",
+      "d_hfree": 219240
+    }
+  ]
+}
+```
+
+**Result:**
+- `DEVICE_CONN.uptime_str` updated.
+- Parent row created with only `deviceID`, `ts` (no dynamic columns).
+- Child row created in `dia_DTF_DTM` with `parent_id` linking to parent.
+
+**Example: root `dS=N`, no child with `dS=Y`** → No rows inserted in `dia_*` tables; only `last_msg_ts` and `uptime_str` updated.
 
 ---
 
-## Database Schema
+### 4. Malformed JSON
 
-### Diagnostic Tables
+If the payload cannot be parsed as JSON, the message is logged to `E_LOG` with category `'M'`, including the raw payload and MQTT topic. If the MQTT 5.0 `client-id` property is present, `devID` is also recorded.
 
-#### Parent table (e.g., `dia_DTF`)
+---
 
-Created automatically when the first root diagnostic of type `DTF` arrives.
+## Connection Tracking – Table `DEVICE_CONN`
 
-```sql
-CREATE TABLE dia_DTF (
-    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    deviceID SMALLINT UNSIGNED NOT NULL,
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-    -- dynamic columns (e.g., UPS, UPT, rssi_dbm, ...)
-    PRIMARY KEY (id)
-);
-```
+| Column           | Type                     | Description                                             |
+|------------------|--------------------------|---------------------------------------------------------|
+| `conn_id`        | INT UNSIGNED             | Auto‑incremented connection identifier                  |
+| `devID`          | SMALLINT UNSIGNED        | Device ID (references `DEVICES.devID`)                  |
+| `projID`         | VARCHAR(251)             | Project ID at connection time (snapshot)                |
+| `connected_ts`   | TIMESTAMP                | Time of connection (online message or first message)    |
+| `last_msg_ts`    | TIMESTAMP                | Time of last message from this device                   |
+| `uptime_str`     | VARCHAR(32)              | Device uptime reported via `d_UPT` (root diagnostic)    |
+| `disconnected_ts`| TIMESTAMP                | Time of disconnection (offline LWT or manual close)     |
 
-#### Child table (e.g., `dia_DTF_DTM`)
-
-Created automatically when the first additional diagnostic of type `DTM` arrives under parent `DTF`.
+### View `vw_CONN_LOG`
 
 ```sql
-CREATE TABLE dia_DTF_DTM (
-    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    deviceID SMALLINT UNSIGNED NOT NULL,
-    parent_id INT UNSIGNED NOT NULL,
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-    -- dynamic columns (e.g., hfree, hlarge, ...)
-    PRIMARY KEY (id)
-);
-```
-
-- `parent_id` references the `id` in `dia_DTF`, linking child data to the parent message.
-
-### Error Log Table (`E_LOG`)
-
-The bridge logs two categories of errors:
-
-- **`M` (Message errors)** – JSON parsing failures (malformed payloads). These now always include a valid `devID` because the bridge extracts the client ID from the MQTT 5.0 User Property. The raw payload and MQTT topic are also stored. At most 200 rows are kept.
-- **`D` (Database errors)** – insertion failures, data too long, out of range, stored procedure errors. At most 1000 rows are kept.
-
-Table structure:
-
-```sql
-CREATE TABLE E_LOG (
-    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    devID SMALLINT UNSIGNED NULL,
-    category CHAR(1) NOT NULL DEFAULT 'D',
-    topic VARCHAR(255) NULL,
-    payload TEXT NULL,
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-    message TEXT NOT NULL,
-    PRIMARY KEY (id),
-    INDEX idx_category_ts (category, ts)
-);
-```
-
-To view recent message errors (JSON parse failures):
-
-```sql
-SELECT * FROM E_LOG WHERE category = 'M' ORDER BY ts DESC LIMIT 20;
-```
-
-### Other Tables
-
-| Table | Purpose |
-|-------|---------|
-| `DEVICES` | Device metadata (`devID`, `devName`, `devLastSeen`, `devPROJID`) |
-| `DEVICE_CONN` | Connection sessions (tracked via `$SYS` logs) |
-| `dt_<projectID>` | Dynamic tables for sensor data |
-| `dia_<type>` | Parent diagnostic tables |
-| `dia_<parent>_<child>` | Child diagnostic tables (with `parent_id`) |
-
-### View `vw_CONN_LOG` for connection history
-
-```sql
-CREATE OR REPLACE VIEW vw_CONN_LOG AS
+DROP VIEW IF EXISTS vw_CONN_LOG;
+CREATE VIEW vw_CONN_LOG AS
 WITH uptime_seconds AS (
     SELECT
         c.conn_id,
@@ -209,8 +222,9 @@ WITH uptime_seconds AS (
         c.projID,
         c.connected_ts,
         c.last_msg_ts,
+        c.uptime_str AS device_uptime,
         c.disconnected_ts,
-        TIMESTAMPDIFF(SECOND, c.connected_ts, IFNULL(c.disconnected_ts, NOW())) AS uptime_sec
+        TIMESTAMPDIFF(SECOND, c.connected_ts, IFNULL(c.disconnected_ts, NOW())) AS duration_sec
     FROM DEVICE_CONN c
 )
 SELECT
@@ -219,35 +233,60 @@ SELECT
     u.projID,
     u.connected_ts,
     u.last_msg_ts,
+    u.device_uptime,
     u.disconnected_ts,
     CONCAT(
-        FLOOR(u.uptime_sec / 86400), 'd ',
-        FLOOR((u.uptime_sec % 86400) / 3600), 'h ',
-        FLOOR((u.uptime_sec % 3600) / 60), 'm'
-    ) AS uptime_str
+        FLOOR(u.duration_sec / 86400), 'd ',
+        FLOOR((u.duration_sec % 86400) / 3600), 'h ',
+        FLOOR((u.duration_sec % 3600) / 60), 'm'
+    ) AS duration_str
 FROM uptime_seconds u
 JOIN DEVICES d ON u.devID = d.devID
 ORDER BY u.connected_ts DESC;
 ```
 
-### Query example: join parent and child tables
+---
 
-To retrieve child diagnostic data along with the parent’s timestamp:
+## Firmware Information in `DEVICES`
 
-```sql
-SELECT
-    p.ts AS parent_ts,
-    c.*
-FROM dia_DTF_DTM c
-JOIN dia_DTF p ON c.parent_id = p.id
-WHERE p.deviceID = 1;
-```
+The following columns are added to the `DEVICES` table and updated when a status message with `"fw"` object is received:
+
+| Column           | Type          | Description                     |
+|------------------|---------------|---------------------------------|
+| `fw_version`     | VARCHAR(32)   | Version string (e.g., `v1.2.3`) |
+| `fw_tag`         | VARCHAR(64)   | Git tag (e.g., `release-1.2.3`) |
+| `fw_major`       | SMALLINT      | Major version number            |
+| `fw_minor`       | SMALLINT      | Minor version number            |
+| `fw_patch`       | SMALLINT      | Patch version number            |
+| `fw_build`       | INT           | Build number                    |
+| `fw_hash_short`  | VARCHAR(16)   | Short Git commit hash           |
+| `fw_hash_full`   | VARCHAR(64)   | Full Git commit hash            |
+| `fw_build_id`    | VARCHAR(64)   | Build identifier                |
+| `fw_dirty`       | BOOLEAN       | Whether build had uncommitted changes |
+| `project_name`   | VARCHAR(64)   | Project name (from firmware)    |
+
+---
+
+## Error Logging – Table `E_LOG`
+
+| Column     | Type          | Description                                      |
+|------------|---------------|--------------------------------------------------|
+| `id`       | INT UNSIGNED  | Auto‑incremented log ID                         |
+| `devID`    | SMALLINT      | Device ID (may be NULL if not extractable)      |
+| `category` | CHAR(1)       | `'M'` for message/JSON errors, `'D'` for database errors |
+| `topic`    | VARCHAR(255)  | MQTT topic of the erroneous message             |
+| `payload`  | TEXT          | Raw message payload (up to 65535 chars)         |
+| `ts`       | TIMESTAMP     | Timestamp of the error                          |
+| `message`  | TEXT          | Error description                               |
+
+- **Category `'M'`** : max 200 rows (oldest automatically deleted)
+- **Category `'D'`** : max 1000 rows (oldest automatically deleted)
 
 ---
 
 ## Configuration (Environment Variables)
 
-All settings are read from environment variables. Create a file `/etc/mqtt2db/env`:
+Create `/etc/mqtt2db/env`:
 
 ```env
 MQTT_BROKER=raspi00
@@ -263,41 +302,16 @@ DB_NAME=IOT_DB
 LOG_LEVEL=INFO
 ```
 
-### Changing Prefixes or Array Field Name
-
-Inside the Python script you can modify:
-
-- `DYNAMIC_FIELD_PREFIXES = ["d_"]` – add more prefixes if needed.
-- `DIAG_ARRAY_FIELD = "diagnostics"` – rename the array key.
-
-After changes, restart the service.
-
----
-
-## Mosquitto Configuration for Connection Tracking
-
-To enable the `$SYS/broker/log/N` topic, add the following line to your `/etc/mosquitto/mosquitto.conf`:
-
-```ini
-log_dest topic
-```
-
-Restart Mosquitto:
-
-```bash
-sudo systemctl restart mosquitto
-```
-
 ---
 
 ## Installing as a Systemd Service
 
-1. Create the environment file (see above).
-2. Create the service file `/etc/systemd/system/mqtt2db.service`:
+1. Create the environment file (above).
+2. Create `/etc/systemd/system/mqtt2db.service`:
 
 ```ini
 [Unit]
-Description=MQTT to MariaDB Data Saver with client-id User Property
+Description=MQTT to MariaDB Bridge (MQTT5 + LWT + Firmware)
 After=network.target mariadb.service mosquitto.service
 
 [Service]
@@ -313,7 +327,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-3. Reload systemd and start:
+3. Reload and start:
 
 ```bash
 sudo systemctl daemon-reload
@@ -323,13 +337,12 @@ sudo systemctl start mqtt2db.service
 
 ---
 
-## Logging
+## Logging and Debugging
 
-- Service logs to **journald** (view with `journalctl -u mqtt2db.service -f`).
-- **JSON parsing errors** (malformed payloads) are logged to `E_LOG` with category `'M'`. Thanks to the MQTT 5.0 `client-id` property, `devID` is always populated. The raw payload and MQTT topic are stored. At most 200 rows are kept.
-- **Database errors** (insertion failures, truncation, etc.) are logged to `E_LOG` with category `'D'`, with a limit of 1000 rows.
-
-To view debug logs, set `LOG_LEVEL=DEBUG` in the environment and restart.
+- View live logs: `sudo journalctl -u mqtt2db.service -f`
+- Set `LOG_LEVEL=DEBUG` in the environment file and restart for verbose output.
+- JSON parsing errors: query `SELECT * FROM E_LOG WHERE category = 'M' ORDER BY ts DESC LIMIT 20;`
+- Database errors: query `SELECT * FROM E_LOG WHERE category = 'D' ORDER BY ts DESC LIMIT 20;`
 
 ---
 
@@ -338,13 +351,14 @@ To view debug logs, set `LOG_LEVEL=DEBUG` in the environment and restart.
 | Symptom | Likely cause / check |
 |---------|----------------------|
 | Service won’t start | `sudo journalctl -u mqtt2db.service -n 50` |
-| MQTT connection fails | Verify `MQTT_BROKER`, `MQTT_PORT`, TLS cert path, credentials. |
-| Data not saved | `dS` missing/invalid? `dPJ` empty? Topic not under `IOT_DB/DAT/`? |
-| Diagnostic root not saved | `dDGT` missing? Topic not under `IOT_DB/DIAG/`? |
-| Child diagnostic not saved | Check `dS` in array entry. |
-| Malformed JSON errors logged | See `E_LOG` with `category = 'M'`; the client ID is always present. |
-| Connection table not updating | Ensure `log_dest topic` is set in Mosquitto and restarted. |
+| MQTT connection fails | Verify broker, port, TLS certs, credentials |
+| Data not saved | `dS` invalid? `dPJ` empty? Topic not under `devices/.../data` or legacy `IOT_DB/DAT/`? |
+| Root diagnostic not saved | No valid `dS` in root AND no child with valid `dS` |
+| Child diagnostic not saved | Child’s `dS` invalid or parent was not created |
+| Uptime not recorded | Missing `d_UPT` (or `d_dUPT`) in root block |
+| Firmware not updated | Status message missing `"fw"` object or not published to `.../status` |
+| `client-id` not recognised | Ensure MQTT 5.0 User Property is set; otherwise fallbacks (topic, `dNM`) are used |
 
 ---
 
-*Documentation version 7.0 – MQTT 5.0 User Property `client-id` for robust device identification.*
+*Documentation version 10.0 – full MQTT5 support, new topic hierarchy, firmware tracking.*
